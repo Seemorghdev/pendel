@@ -1,0 +1,20 @@
+# python
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# data: raw feeds and the database stay local (repo root only, not web/data/)
+/data/
+*.duckdb
+*.duckdb.wal
+
+# the page's live data is built by CI, not committed
+web/data/jobs.json
+
+# run files between overseer and agent stay local
+runs/
+
+# logs and secrets
+*.log
+.env

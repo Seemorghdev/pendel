@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PENDEL.EXE</title>
+<style>
+:root{--bg:#c9c6bd;--win:#f2f0ea;--ink:#111;--dim:#6b6860;--hi:#111;--hitxt:#f2f0ea;--mark:#b3261e}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg) repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.025) 2px 3px);font:13px/1.45 Monaco,Menlo,"Courier New",monospace;color:var(--ink);padding:18px 18px 70px}
+button,select,input{font:inherit;color:inherit}
+.win{background:var(--win);border:2px solid var(--ink);box-shadow:4px 4px 0 var(--ink);max-width:1200px;margin:0 auto}
+.bar{display:flex;align-items:center;gap:10px;border-bottom:2px solid var(--ink);padding:3px 8px;background:repeating-linear-gradient(0deg,var(--win) 0 2px,var(--ink) 2px 3px)}
+.bar span{background:var(--win);padding:0 8px;font-weight:700;margin:0 auto}
+.bar i{width:12px;height:12px;border:2px solid var(--ink);background:var(--win)}
+.ctl{display:flex;flex-wrap:wrap;gap:14px 22px;padding:10px 12px;border-bottom:2px solid var(--ink);align-items:center}
+.ctl label{display:flex;gap:6px;align-items:center}
+select{background:var(--win);border:2px solid var(--ink);padding:1px 4px}
+input[type=range]{accent-color:var(--ink);width:150px}
+input[type=checkbox]{accent-color:var(--ink)}
+.cats{display:flex;flex-wrap:wrap;gap:0;border-bottom:2px solid var(--ink)}
+.cats button{background:none;border:0;border-right:2px solid var(--ink);padding:4px 12px;cursor:pointer}
+.cats button.on{background:var(--hi);color:var(--hitxt)}
+.cats button:hover:not(.on){text-decoration:underline}
+.body{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,440px)}
+.left{border-right:2px solid var(--ink);min-width:0}
+.status{padding:6px 12px;border-bottom:1px dashed var(--ink)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-weight:700;padding:5px 8px;border-bottom:2px solid var(--ink);white-space:nowrap}
+td{padding:4px 8px;border-bottom:1px dotted #aaa;vertical-align:top}
+tr.r{cursor:pointer}
+tr.r:hover td,tr.r.sel td{background:var(--hi);color:var(--hitxt)}
+.new{color:var(--mark);font-weight:700}
+tr.r:hover .new,tr.r.sel .new{color:var(--hitxt)}
+.dim{color:var(--dim)}
+tr.r:hover .dim,tr.r.sel .dim{color:var(--hitxt)}
+.right{min-width:0;display:flex;flex-direction:column}
+.mapbox{position:relative;width:100%;height:clamp(300px,52vh,460px);border-bottom:2px solid var(--ink);overflow:hidden}
+#map{width:100%;height:100%;display:block;cursor:crosshair}
+.detail{padding:10px 12px;white-space:pre-wrap;min-height:160px}
+.detail b{font-weight:700}
+.foot{padding:5px 12px;border-top:2px solid var(--ink);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.blink{animation:b 1s steps(1) infinite}@keyframes b{50%{opacity:0}}
+@media (max-width:900px){.body{grid-template-columns:1fr}.left{border-right:0;border-bottom:2px solid var(--ink)}}
+@media print{body{padding:0}.win{box-shadow:none}}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="bar"><i></i><span>PENDEL.EXE — companies within reach</span></div>
+
+  <div class="ctl">
+    <label>FROM <select id="home"></select></label>
+    <label>RADIUS <input id="radius" type="range" min="20" max="260" step="5" value="150"> <b id="rl">150 km</b></label>
+    <label><input type="checkbox" id="en" checked> English only</label>
+    <label><input type="checkbox" id="nw"> New today</label>
+    <label><input type="checkbox" id="rm" checked> + Remote</label>
+  </div>
+  <div class="cats" id="cats"></div>
+
+  <div class="body">
+    <div class="left">
+      <div class="status" id="status"></div>
+      <table>
+        <thead><tr><th>KM</th><th>COMPANY</th><th>CITY</th><th>ROLE</th><th>PAY/MO</th><th>FEED</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <div class="right">
+      <div class="mapbox"><svg id="map" preserveAspectRatio="xMidYMid meet"></svg></div>
+      <div class="detail" id="detail">&gt; select a row or a dot<span class="blink">_</span></div>
+    </div>
+  </div>
+
+  <div class="foot"><span id="upd"></span><span><span id="src"></span> · click map to move centre</span></div>
+</div>
+
+<script>
+
+const CATS=[["all","ALL"],["support","IT SUPPORT"],["desk","SERVICE DESK"],["cloud","CLOUD"],["data","DATA"],["auto","AUTOMATION"],["chips","SEMICON"],["logi","LOGISTICS"]];
+const HOMES={Duisburg:[51.432,6.762],"Düsseldorf":[51.220,6.792],Essen:[51.451,7.013]};
+const CITIES=[["Amsterdam",52.372,4.895],["Utrecht",52.090,5.122],["Rotterdam",51.922,4.478],["Arnhem",51.985,5.905],["Eindhoven",51.441,5.470],["Venlo",51.370,6.172],["Duisburg",51.432,6.762],["Düsseldorf",51.220,6.792],["Köln",50.938,6.958],["Dortmund",51.514,7.466],["Aachen",50.776,6.083],["Nijmegen",51.842,5.853],["Den Haag",52.078,4.312],["Essen",51.451,7.013]];
+const BORDER=[[52.75,7.08],[52.24,7.04],[52.03,6.72],[51.87,6.4],[51.82,5.98],[51.5,6.2],[51.3,6.2],[51.05,5.9],[50.77,6.02]];
+// The page reads one file: data/jobs.json (built daily), or data/jobs.sample.json if that is missing.
+let DATA, TODAY, byId, SOURCE;
+
+const S={cat:"all",c:HOMES.Duisburg,cn:"Duisburg",r:150,en:true,nw:false,rm:true,sel:null};
+const $=id=>document.getElementById(id);
+
+function km(a,b){const t=Math.PI/180,dLa=(b[0]-a[0])*t,dLo=(b[1]-a[1])*t,h=Math.sin(dLa/2)**2+Math.cos(a[0]*t)*Math.cos(b[0]*t)*Math.sin(dLo/2)**2;return 2*6371*Math.asin(Math.sqrt(h));}
+
+function rows(){
+  return DATA.jobs.map(j=>{const c=byId[j.company_id];return {...j,c,d:c.remote?null:km(S.c,[c.lat,c.lon])};})
+   .filter(j=>!S.en||j.lang==="en")
+   .filter(j=>!S.nw||j.first_seen===TODAY)
+   .filter(j=>S.cat==="all"||j.c.categories.includes(S.cat))
+   .filter(j=>j.c.remote?S.rm:j.d<=S.r)
+   .sort((a,b)=>(a.d??1e9)-(b.d??1e9));
+}
+
+// map projection
+const L0=3.9,L1=8.0,A0=50.55,A1=52.6,K=200,COS=Math.cos(51.5*Math.PI/180);
+const P=(la,lo)=>[(lo-L0)*K*COS,(A1-la)*K], UN=(x,y)=>[A1-y/K,L0+x/(K*COS)];
+const W=(L1-L0)*K*COS,H=(A1-A0)*K;
+
+function render(){
+  $("cats").innerHTML=CATS.map(([id,n])=>`<button class="${S.cat===id?"on":""}" data-c="${id}">${n}</button>`).join("");
+  document.querySelectorAll(".cats button").forEach(b=>b.onclick=()=>{S.cat=b.dataset.c;render();});
+
+  const R=rows(), cos=new Set(R.map(r=>r.c.id)), fresh=R.filter(r=>r.first_seen===TODAY).length;
+  $("status").textContent=`${R.length} roles · ${cos.size} companies · ${fresh} new today · ${S.r} km from ${S.cn}`;
+  $("rows").innerHTML=R.length?R.map(r=>`<tr class="r ${S.sel===r.c.id?"sel":""}" data-id="${r.c.id}">
+     <td>${r.d==null?"—":Math.round(r.d)}</td><td>${r.c.name}</td><td class="dim">${r.c.city}</td>
+     <td>${r.first_seen===TODAY?'<span class="new">*</span> ':""}${r.title}${r.lang!=="en"?` <span class="dim">[${r.lang}]</span>`:""}</td>
+     <td class="dim">${r.salary?"€"+r.salary:"—"}</td><td class="dim">${r.c.feed_open?r.c.ats:r.c.ats+" (mail)"}</td></tr>`).join("")
+    :`<tr><td colspan="6" class="dim">no match. widen radius.</td></tr>`;
+  document.querySelectorAll("tr.r").forEach(t=>t.onclick=()=>select(t.dataset.id));
+
+  // map
+  const [cx,cy]=P(...S.c), rr=S.r/111.2*K;
+  let s=`<rect width="${W}" height="${H}" fill="var(--win)"/>
+   <polyline points="${BORDER.map(p=>P(...p).join(",")).join(" ")}" fill="none" stroke="#999" stroke-dasharray="4 4"/>
+   <text x="${P(52.45,4.6)[0]}" y="${P(52.45,4.6)[1]}" fill="#999" font-size="12">NL</text>
+   <text x="${P(52.45,7.3)[0]}" y="${P(52.45,7.3)[1]}" fill="#999" font-size="12">DE</text>
+   <circle cx="${cx}" cy="${cy}" r="${rr}" fill="none" stroke="var(--ink)" stroke-width="1.5" stroke-dasharray="6 4"/>`;
+  s+=CITIES.map(([n,la,lo])=>{const[x,y]=P(la,lo);return `<text x="${x+5}" y="${y-5}" font-size="9" fill="#888">${n}</text>`}).join("");
+  s+=`<path d="M${cx-7},${cy}h14M${cx},${cy-7}v14" stroke="var(--mark)" stroke-width="2.5"/>`;
+  DATA.companies.filter(c=>!c.remote).forEach(c=>{const[x,y]=P(c.lat,c.lon),on=cos.has(c.id),sel=S.sel===c.id;
+    s+=`<rect class="dot" data-id="${c.id}" x="${x-4}" y="${y-4}" width="8" height="8" fill="${on?(c.feed_open?"var(--ink)":"var(--win)"):"#ccc"}" stroke="${on?"var(--ink)":"#ccc"}" stroke-width="1.5" style="cursor:${on?"pointer":"default"}"/>`;
+    if(sel)s+=`<rect x="${x-8}" y="${y-8}" width="16" height="16" fill="none" stroke="var(--mark)" stroke-width="2"/>`;});
+  $("map").setAttribute("viewBox",`0 0 ${W} ${H}`);
+  $("map").innerHTML=s;
+  document.querySelectorAll(".dot").forEach(d=>d.onclick=e=>{e.stopPropagation();if(cos.has(d.dataset.id))select(d.dataset.id);});
+  $("upd").textContent=`last update ${DATA.generated_at.replace("T"," ").slice(0,16)} UTC`;
+}
+
+function select(id){
+  S.sel=id;const c=byId[id],js=DATA.jobs.filter(j=>j.company_id===id),d=c.remote?"remote":Math.round(km(S.c,[c.lat,c.lon]))+" km";
+  $("detail").innerHTML=`<b>${c.name}</b>\n${c.city} · ${d} · feed: ${c.ats}${c.feed_open?"":" (closed, email alert)"}\n\n`+
+    js.map(j=>`${j.first_seen===TODAY?'<span class="new">*</span>':" "} ${j.title} [${j.lang}] ${j.salary?"€"+j.salary:""}\n  first seen ${j.first_seen} · <a href="${j.url}">apply on site</a>`).join("\n");
+  render();
+}
+
+$("home").innerHTML=Object.keys(HOMES).map(h=>`<option>${h}</option>`).join("");
+$("home").onchange=e=>{S.c=HOMES[e.target.value];S.cn=e.target.value;render();};
+$("radius").oninput=e=>{S.r=+e.target.value;$("rl").textContent=S.r+" km";render();};
+$("en").onchange=e=>{S.en=e.target.checked;render();};
+$("nw").onchange=e=>{S.nw=e.target.checked;render();};
+$("rm").onchange=e=>{S.rm=e.target.checked;render();};
+$("map").addEventListener("click",e=>{const svg=$("map"),pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;
+  const p=pt.matrixTransform(svg.getScreenCTM().inverse());S.c=UN(p.x,p.y);
+  const n=CITIES.map(c=>[c[0],km(S.c,[c[1],c[2]])]).sort((a,b)=>a[1]-b[1])[0];S.cn=(n[1]<15?"":"~")+n[0];render();});
+async function load(){
+  for (const f of ["data/jobs.json","data/jobs.sample.json"]){
+    try{const r=await fetch(f,{cache:"no-store"});if(r.ok){DATA=await r.json();SOURCE=f;break;}}catch(e){}
+  }
+  if(!DATA){$("status").textContent="no data file found. serve this folder over http (python -m http.server -d web).";return;}
+  TODAY=DATA.generated_at.slice(0,10);
+  byId=Object.fromEntries(DATA.companies.map(c=>[c.id,c]));
+  $("src").textContent=SOURCE.includes("sample")?"SAMPLE DATA":"LIVE DATA";
+  render();
+}
+load();
+</script>
+</body>
+</html>
