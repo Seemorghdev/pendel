@@ -255,6 +255,35 @@ class Runner:
         new_items: list[dict] = []
         baseline_count = 0
         by_status = Counter()
+        # Persist the set of currently degraded feeds so scheduled runs can
+        # report transitions once, then stay quiet until the set changes or
+        # all feeds recover.
+        prior_health = self.state.get("feed_health_signature", [])
+        degraded = sorted([s["source_id"], s["status"]] for s in statuses if not s["complete"])
+        if degraded != prior_health:
+            if degraded:
+                detail_by_id = {s["source_id"]: s for s in statuses}
+                lines = ["Pendel feed health notice — some public feeds need attention."]
+                for source_id, status_name in degraded[:12]:
+                    entry = detail_by_id[source_id]
+                    lines.append(f"• {entry['companies']} ({entry['ats']}): {status_name}")
+                if len(degraded) > 12:
+                    lines.append(f"• Plus {len(degraded) - 12} other affected feeds; see the private run report.")
+            elif prior_health:
+                lines = ["Pendel feed health recovered — all monitored public feeds completed successfully."]
+            else:
+                lines = []
+            if lines:
+                message = "\n".join(lines)
+                transition_key = json.dumps([prior_health, degraded, now], ensure_ascii=False)
+                notice_id = "health:" + hashlib.sha256(transition_key.encode()).hexdigest()[:20]
+                self.state["outbox"].append({
+                    "outbox_id": notice_id, "status": "pending", "created_at": now,
+                    "updated_at": now, "attempts": 0, "error": "",
+                    "chunk_statuses": ["pending"],
+                    "payload": {"items": [], "chunks": [message]},
+                })
+            self.state["feed_health_signature"] = degraded
         baseline_before = {key: bool(value.get("baseline_complete"))
                            for key, value in self.state["sources"].items()}
         for status in statuses:
@@ -319,6 +348,7 @@ class Runner:
                         ["source_id", "companies", "ats", "status", "error", "job_count", "complete"])
         summary = {
             "run_at": now, "sources": len(sources), "source_status": dict(by_status),
+            "incomplete_sources": sum(1 for status in statuses if not status["complete"]),
             "current_unique_listings": len(current), "first_seen": len(new_items),
             "silent_baseline_listings": baseline_count,
             "current_decisions": {key: len(rows) for key, rows in reports.items()},
@@ -328,7 +358,11 @@ class Runner:
         (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (output / "SUMMARY.md").write_text(self._markdown_summary(summary, reports), encoding="utf-8")
         print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
-        return 0 if not any(s["status"] == "rate_limited" for s in statuses) else 2
+        # Feed-level failures are represented in source-status.csv, the
+        # transition notice, and the summary. Returning success lets the
+        # workflow persist and deliver those notices while keeping incomplete
+        # sources out of both baseline and first-seen accounting.
+        return 0
 
     @staticmethod
     def _digest_item(value: dict) -> dict:
@@ -374,9 +408,12 @@ class Runner:
                  f"- Results: {json.dumps(summary['source_status'], sort_keys=True)}", "",
                  "## First-seen baseline", "", f"- First observed in this run: {summary['first_seen']}",
                  f"- Quiet initial baseline: {summary['silent_baseline_listings']}",
-                 "- Failed or partial feeds do not complete a baseline or mark listings closed.", "",
+                 "- Failed or partial feeds do not complete a baseline or mark listings closed."]
+        if summary.get("incomplete_sources"):
+            lines.extend([f"- Incomplete sources: {summary['incomplete_sources']}; first-seen counts include completed sources only."])
+        lines.extend(["",
                  "## Notifications", "", "- Delivery is disabled in this run.",
-                 f"- Pending outbox digests: {summary['telegram_outbox_pending']}", ""]
+                 f"- Pending outbox messages: {summary['telegram_outbox_pending']}", ""])
         return "\n".join(lines)
 
     def claim(self) -> int:

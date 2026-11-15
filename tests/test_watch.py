@@ -131,7 +131,31 @@ def test_failed_or_partial_source_does_not_complete_baseline(monkeypatch, tmp_pa
     status = state["sources"][source()["source_id"]]
     assert status["baseline_complete"] is False
     assert not state["jobs"]
-    assert not state["outbox"]
+    assert len(state["outbox"]) == 1
+    assert "feed health notice" in state["outbox"][0]["payload"]["chunks"][0].lower()
+
+
+def test_feed_health_notice_is_quiet_until_change_and_reports_recovery(monkeypatch, tmp_path):
+    def offline(*_args):
+        raise OSError("feed unavailable")
+
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    runner = Runner(config(), state)
+    monkeypatch.setattr(fetch, "fetch_jobs", offline)
+    runner.prepare([source()], tmp_path / "failure-one")
+    assert len(state["outbox"]) == 1
+    runner.prepare([source()], tmp_path / "failure-two")
+    assert len(state["outbox"]) == 1
+
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda *_args: [])
+    runner.prepare([source()], tmp_path / "recovered")
+    assert len(state["outbox"]) == 2
+    assert "recovered" in state["outbox"][1]["payload"]["chunks"][0].lower()
+
+    monkeypatch.setattr(fetch, "fetch_jobs", offline)
+    runner.prepare([source()], tmp_path / "failure-again")
+    assert len(state["outbox"]) == 3
+    assert "feed health notice" in state["outbox"][2]["payload"]["chunks"][0].lower()
 
 
 def test_partial_source_does_not_prevent_later_source_from_being_processed(monkeypatch, tmp_path):
