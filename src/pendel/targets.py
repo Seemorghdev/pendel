@@ -247,6 +247,7 @@ def _explicit_remote_region(location: str) -> str:
         ("United States", r"\bunited states(?: of america)?\b|\b(?:u\.s\.?(?:a\.)?|usa|us)(?:[- ]only)?(?=\W|$)"),
         ("Canada", r"\bcanada(?:[- ]only)?\b"),
         ("India", r"\bindia(?:[- ]only)?\b"),
+        ("Caribbean", r"\bcaribbean\b"),
     )
     return next((name for name, pattern in regions if re.search(pattern, text, re.I)), "")
 

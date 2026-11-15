@@ -88,7 +88,7 @@ def test_explicit_non_german_remote_regions_are_excluded_without_country_field()
         "tiers": {"2": {"phrases": ["Customer Support"]}},
         "exclusions": {},
     }
-    for location in ("Remote (North America)", "Canada-only", "Remote India", "US only"):
+    for location in ("Remote (North America)", "Canada-only", "Remote India", "US only", "Remote Caribbean"):
         result = evaluate_job({"title": "Customer Support Agent", "location": location,
                                "work_mode": "remote", "language_requirement": "English required"}, cfg)
         assert result["status"] == "exclude", location
