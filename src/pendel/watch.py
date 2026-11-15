@@ -74,7 +74,7 @@ def _endpoint_key(ats: str, url: str, token: str = "") -> str:
 def _feed_variant(url: str) -> str:
     """Canonicalize fetch-only options while preserving content variants such as language."""
     p = urlsplit(url.strip())
-    ignored = {"content", "includecompensation", "limit", "offset"}
+    ignored = {"content", "includecompensation", "limit", "offset", "per_page"}
     query = [(key, value) for key, value in parse_qsl(p.query, keep_blank_values=True)
              if key.casefold() not in ignored]
     return urlunsplit((p.scheme.casefold(), p.netloc.casefold(), p.path.rstrip("/") or "/",

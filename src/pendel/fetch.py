@@ -35,6 +35,10 @@ TIMEOUT = 30
 MAX_BYTES = 40_000_000
 SR_PAGE = 100
 SR_MAX_PAGES = 20
+TEAMTAILOR_PAGE = 100
+TEAMTAILOR_MAX_PAGES = 20
+TRAKSTAR_PAGE = 250
+TRAKSTAR_MAX_PAGES = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -149,6 +153,56 @@ def fetch_jobs(feed, throttle):
         return readers.parse_personio(get(url, throttle), token, tld)
     if ats == "softgarden":
         return readers.parse_softgarden(json.loads(get(url, throttle)))
+    if ats == "teamtailor":
+        out = []
+        offset = 0
+        for page in range(TEAMTAILOR_MAX_PAGES):
+            page_url = with_query(url, f"offset={offset}&per_page={TEAMTAILOR_PAGE}")
+            jobs = readers.parse_teamtailor_rss(get(page_url, throttle))
+            out.extend(jobs)
+            if len(jobs) < TEAMTAILOR_PAGE:
+                break
+            offset += len(jobs)
+        else:
+            raise IncompleteFeed(
+                f"Teamtailor RSS pagination capped at {len(out)} postings", out,
+            )
+        return out
+    if ats == "recruiterbox":
+        out = []
+        total_found = None
+        offset = 0
+        for page in range(TRAKSTAR_MAX_PAGES):
+            page_url = with_query(
+                url, f"client_name={token}&limit={TRAKSTAR_PAGE}&offset={offset}",
+            )
+            data = json.loads(get(page_url, throttle))
+            jobs = readers.parse_trakstar_frontend(data)
+            out.extend(jobs)
+            raw_openings = data.get("openings", []) if isinstance(data, dict) else []
+            raw_count = len(raw_openings) if isinstance(raw_openings, list) else len(jobs)
+            offset += raw_count
+            meta = data.get("meta") if isinstance(data, dict) else {}
+            if isinstance(meta, dict):
+                raw_total = meta.get("total_count", meta.get("total"))
+                try:
+                    total_found = int(raw_total) if raw_total is not None else None
+                except (TypeError, ValueError):
+                    total_found = None
+            if total_found is not None:
+                if len(out) >= total_found:
+                    break
+            elif len(jobs) < TRAKSTAR_PAGE:
+                break
+        else:
+            raise IncompleteFeed(
+                f"Recruiterbox pagination capped at {len(out)} postings", out,
+            )
+        if total_found is not None and len(out) < total_found:
+            raise IncompleteFeed(
+                f"Recruiterbox pagination returned {len(out)} of {total_found} postings", out,
+            )
+        return out
     if ats == "pinpoint":
         return readers.parse_pinpoint(json.loads(get(url, throttle)))
     if ats == "smartrecruiters":

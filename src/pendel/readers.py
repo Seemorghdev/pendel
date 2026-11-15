@@ -19,6 +19,7 @@ import html
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 # Requirements ("fluent German") usually sit at the end of a posting, so keep it whole.
 DESC_MAX = 20000
@@ -104,6 +105,20 @@ def iso_date(value):
         return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     m = re.match(r"\d{4}-\d{2}-\d{2}", str(value))
     return m.group(0) if m else ""
+
+
+def rss_date(value):
+    """Parse an RSS publication date into YYYY-MM-DD when possible."""
+    if not value:
+        return ""
+    direct = iso_date(value)
+    if direct:
+        return direct
+    try:
+        parsed = parsedate_to_datetime(str(value))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    return parsed.date().isoformat() if parsed else ""
 
 
 def job(**kw):
@@ -299,6 +314,107 @@ def parse_pinpoint(data):
                       or mode_from_text(location, p.get("title", "")),
             url=p.get("url", ""), posted_at=iso_date(p.get("created_at")),
             description=text(p.get("description", "")),
+        ))
+    return _unique_jobs(out)
+
+
+def _xml_local_name(tag):
+    return tag.rsplit("}", 1)[-1].casefold()
+
+
+def _xml_values(element, names):
+    wanted = {name.casefold() for name in names}
+    values = []
+    for child in element.iter():
+        if child is element or _xml_local_name(child.tag) not in wanted:
+            continue
+        value = " ".join(part.strip() for part in child.itertext() if part.strip())
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _xml_value(element, names):
+    return next(iter(_xml_values(element, names)), "")
+
+
+def parse_teamtailor_rss(xml_text):
+    """Parse Teamtailor's public jobs RSS feed into Pendel's common job shape."""
+    root = ET.fromstring(xml_text)
+    out = []
+    for item in (node for node in root.iter() if _xml_local_name(node.tag) == "item"):
+        title = _xml_value(item, ("title",))
+        url = _xml_value(item, ("link", "url", "apply_url"))
+        if not url:
+            link_node = next((node for node in item.iter()
+                              if _xml_local_name(node.tag) == "link" and node.get("href")), None)
+            url = link_node.get("href", "") if link_node is not None else ""
+        guid = _xml_value(item, ("guid", "id", "global_id"))
+        location = "; ".join(_xml_values(item, ("location", "locations")))
+        remote = _xml_value(item, ("remote", "remote_status", "is_remote"))
+        mode = "remote" if remote.casefold() in {"yes", "true", "1", "remote", "fully remote"} else ""
+        published = _xml_value(item, ("pubdate", "published", "published_at", "date"))
+        description = _xml_value(item, ("description", "encoded", "content"))
+        metadata = []
+        for label, aliases in (("Department", ("department",)), ("Role", ("role",)),
+                               ("Division", ("division",))):
+            value = _xml_value(item, aliases)
+            if value:
+                metadata.append(f"{label}: {text(value, 500)}")
+        if remote:
+            metadata.append(f"Teamtailor remote status: {remote}")
+        if metadata:
+            description = "\n\n".join(part for part in (text(description), *metadata) if part)
+        out.append(job(
+            job_id=guid or url or title,
+            title=text(title),
+            location=text(location, 1000),
+            country=country_code(location),
+            work_mode=mode or mode_from_text(location, title),
+            url=url,
+            posted_at=rss_date(published),
+            description=description[:DESC_MAX],
+        ))
+    return out
+
+
+def parse_trakstar_frontend(data):
+    """Parse the documented public Trakstar Hire Frontend openings response."""
+    openings = data.get("openings", []) if isinstance(data, dict) else []
+    if not isinstance(openings, list):
+        raise ValueError("Trakstar Frontend response has no openings list")
+    out = []
+    for opening in openings:
+        if not isinstance(opening, dict):
+            continue
+        loc = opening.get("location") or {}
+        if isinstance(loc, dict):
+            city = loc.get("city") or ""
+            state = loc.get("state") or ""
+            country = loc.get("country") or ""
+            location = ", ".join(part for part in (city, state, country) if part)
+        else:
+            location = str(loc)
+            country = location
+        description = text(opening.get("description", ""))
+        metadata = []
+        for label, value in (("Position type", opening.get("position_type")),
+                             ("Team", opening.get("team")),
+                             ("Remote allowed", opening.get("allows_remote"))):
+            if value not in (None, ""):
+                metadata.append(f"{label}: {value}")
+        if metadata:
+            description = "\n\n".join(part for part in (description, *metadata) if part)
+        out.append(job(
+            job_id=opening.get("id"),
+            title=opening.get("title", ""),
+            location=location,
+            country=country_code(country),
+            # allows_remote permits remote work; it does not prove this role is fully remote.
+            work_mode=mode_from_text(location, opening.get("title", "")),
+            url=opening.get("hosted_url", ""),
+            # close_date is not a publication date.
+            description=description[:DESC_MAX],
         ))
     return _unique_jobs(out)
 

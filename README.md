@@ -8,7 +8,7 @@ Pendel is a small Python toolkit for reading public applicant-tracking-system fe
 private source manifest -> public-feed readers -> first-seen state -> private rules -> match/review reports
 ```
 
-- **Public readers:** Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters, Personio, Softgarden, and Pinpoint.
+- **Public readers:** Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters, Personio, Softgarden, Pinpoint, Teamtailor RSS, and the Trakstar Hire Frontend API.
 - **Matching:** rules are loaded from a JSON file supplied by the caller. This package contains no personal location or role-target configuration.
 - **State:** the watcher imports a compact logical state export into DuckDB, tracks first-seen provider/tenant/listing IDs and feed health, and writes a new state export. A failed or partial feed cannot complete a baseline or mark jobs closed.
 - **Notifications:** the outbox is durable and delivery is opt-in. The Telegram adapter requires both an explicit command flag and an approval environment setting.
