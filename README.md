@@ -1,45 +1,37 @@
-# pendel
+# Pendel
 
-Find English-language tech jobs at companies you can actually commute to.
+Pendel is a small Python toolkit for reading public applicant-tracking-system feeds, normalizing job listings, and applying caller-supplied matching rules. A private runtime can reuse the library while keeping employer lists, location groups, search preferences, and notification state outside this public repository.
 
-Pick a home point and a radius. pendel shows which companies inside it have open roles today, which are new, and which are in English. It is built for a cross-border commute: living in the Rhine-Ruhr area, working in the Netherlands or Düsseldorf.
+## Pipeline
 
-> Status: early. The page runs on sample data; the daily pipeline is being built.
-
-## How it works
-
-```
-companies.csv ──► detect ──► fetch ──► classify ──► export ──► web/
- (who, where)     (which      (public    (language,    (jobs.json)  (static page:
-                  recruiting   feeds,     category,                  radius, map,
-                  system)      DuckDB)    first seen)                filters)
+```text
+private source manifest -> public-feed readers -> first-seen state -> private rules -> match/review reports
 ```
 
-1. **detect**: open each company's careers page once and recognise its recruiting system (Greenhouse, Lever, Ashby, Recruitee, Personio, SmartRecruiters, Workable). Closed systems such as Workday are recorded, not read.
-2. **fetch**: once a day, read each company's public job feed and store every posting in DuckDB with the date it was first seen.
-3. **classify**: language of the posting, role category from the title, salary when listed.
-4. **export**: write `web/data/jobs.json`. The page reads only that file.
+- **Public readers:** Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters, Personio, Softgarden, and Pinpoint.
+- **Matching:** rules are loaded from a JSON file supplied by the caller. This package contains no personal location or role-target configuration.
+- **State:** the watcher imports a compact logical state export into DuckDB, tracks first-seen provider/tenant/listing IDs and feed health, and writes a new state export. A failed or partial feed cannot complete a baseline or mark jobs closed.
+- **Notifications:** the outbox is durable and delivery is opt-in. The Telegram adapter requires both an explicit command flag and an approval environment setting.
 
-## Rules it follows
+## Guardrails
 
-- **Only public recruiting-system feeds and company career pages.** No LinkedIn, Indeed, StepStone, Glassdoor or Bundesagentur Jobbörse: their terms forbid automated access.
-- One request per company per run, at least 2 seconds apart, an honest User-Agent, `robots.txt` respected, and it stops on rate limits.
+- Use only public ATS job feeds and documented public endpoints.
+- Do not automate LinkedIn, other job boards, or Bundesagentur job-search pages.
+- Do not query private ATS endpoints or internal APIs.
+- Throttle requests by host, stop querying a rate-limited host for the run, and retain failures in the source report.
+- Keep personal source lists, target configuration, state, run reports, and secrets in a private runtime.
 
-## Run it
+## Local development
 
-```bash
-python -m venv .venv && source .venv/bin/activate
+```sh
+python -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
 pytest -q
-python -m pendel.detect companies/companies.csv companies/companies-ats.csv --limit 3
 ```
 
-Open `web/index.html` through a local server (`python -m http.server -d web`) to see the page.
+The private watcher supplies its own source manifest, target configuration, state export, database path, and report directory. The public package does not contain user-specific defaults.
 
-## Stack
-
-Python, DuckDB, plain HTML/JS, GitHub Actions.
-
-## Licence
+## License
 
 MIT
