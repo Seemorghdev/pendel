@@ -179,7 +179,7 @@ def fetch_jobs(feed, throttle):
             data = json.loads(get(page_url, throttle))
             jobs = readers.parse_trakstar_frontend(data)
             out.extend(jobs)
-            raw_openings = data.get("openings", []) if isinstance(data, dict) else []
+            raw_openings = (data.get("openings") or data.get("objects") or []) if isinstance(data, dict) else []
             raw_count = len(raw_openings) if isinstance(raw_openings, list) else len(jobs)
             offset += raw_count
             meta = data.get("meta") if isinstance(data, dict) else {}

@@ -380,7 +380,9 @@ def parse_teamtailor_rss(xml_text):
 
 def parse_trakstar_frontend(data):
     """Parse the documented public Trakstar Hire Frontend openings response."""
-    openings = data.get("openings", []) if isinstance(data, dict) else []
+    # The public Frontend API returns records under ``objects`` (with older
+    # responses/documentation sometimes calling them ``openings``).
+    openings = (data.get("openings") or data.get("objects") or []) if isinstance(data, dict) else []
     if not isinstance(openings, list):
         raise ValueError("Trakstar Frontend response has no openings list")
     out = []
