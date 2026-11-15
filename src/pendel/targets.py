@@ -12,7 +12,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from pendel.readers import country_code
+from pendel.readers import COUNTRY_NAMES, country_code
 
 
 def norm(value: str) -> str:
@@ -84,7 +84,17 @@ def _mode(job: dict[str, Any]) -> str:
 
 
 def _country(job: dict[str, Any]) -> str:
-    return country_code(str(job.get("country") or "")) or country_code(str(job.get("location") or ""))
+    structured = country_code(str(job.get("country") or ""))
+    if structured:
+        return structured
+    location = str(job.get("location") or "")
+    low = location.casefold()
+    codes = {code for name, code in COUNTRY_NAMES.items()
+             if re.search(rf"(?<!\w){re.escape(name.casefold())}(?!\w)", low)}
+    valid_codes = set(COUNTRY_NAMES.values())
+    codes.update(code for code in re.findall(r"(?<![A-Za-z])([A-Z]{2})(?![A-Za-z])", location)
+                 if code in valid_codes)
+    return next(iter(codes)) if len(codes) == 1 else ""
 
 
 def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, list[str]]:
@@ -221,10 +231,24 @@ def _evidence_exclusions(job: dict[str, Any], config: dict[str, Any]) -> list[st
     out = []
     for label, patterns in rules.items():
         for pattern in patterns if isinstance(patterns, list) else [patterns]:
-            if re.search(pattern, title if label in {"student", "senior"} else body, re.I):
+            if re.search(pattern, title if label in {"student", "senior", "non_target_title"} else body, re.I):
                 out.append(f"{label}: {pattern}")
                 break
     return out
+
+
+def _explicit_remote_region(location: str) -> str:
+    """Recognize explicit non-Germany remote restrictions without guessing cities."""
+    text = norm(location)
+    if re.search(r"\b(germany|deutschland)\b|(?<!\w)de(?!\w)", text, re.I):
+        return ""
+    regions = (
+        ("North America", r"\bnorth\s+america(?:n)?\b|\bna[- ]only\b"),
+        ("United States", r"\bunited states(?: of america)?\b|\b(?:u\.s\.?(?:a\.)?|usa|us)(?:[- ]only)?(?=\W|$)"),
+        ("Canada", r"\bcanada(?:[- ]only)?\b"),
+        ("India", r"\bindia(?:[- ]only)?\b"),
+    )
+    return next((name for name, pattern in regions if re.search(pattern, text, re.I)), "")
 
 
 def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
@@ -239,6 +263,10 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     language_status, german_level, language_reasons = _language(job, config)
     hour_status, hours = _hours(job)
     exclusions = _evidence_exclusions(job, config)
+    if work_mode == "remote" and not country:
+        remote_region = _explicit_remote_region(str(job.get("location") or ""))
+        if remote_region:
+            exclusions.append(f"remote eligibility restricted outside Germany ({remote_region})")
     if language_status == "language_mismatch":
         exclusions.extend(language_reasons)
 
@@ -306,7 +334,7 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
             continue
     reasons.extend(exclusions)
 
-    if exclusions or below_threshold:
+    if exclusions or below_threshold or not tier_hits:
         status = "exclude"
         candidates = []
     elif reasons or not candidates:
