@@ -159,6 +159,23 @@ def test_excluded_listing_never_enters_notification_outbox(monkeypatch, tmp_path
     assert state["outbox"] == []
 
 
+def test_new_tier_match_with_unknown_location_is_queued_for_review(monkeypatch, tmp_path):
+    fetched = [listing("one")]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _source, _throttle: list(fetched))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    runner = Runner(config(), state)
+    runner.prepare([source()], tmp_path / "baseline")
+    fetched.append(listing("two", title="Customer Support Specialist", location="", mode=""))
+    fetched[-1]["country"] = ""
+    runner.prepare([source()], tmp_path / "new")
+    assert len(state["outbox"]) == 1
+    item = state["outbox"][0]["payload"]["items"][0]
+    assert item["status"] == "review"
+    assert item["tiers"] == ["2"]
+    assert not item["groups"]
+    assert "does not identify" in " ".join(item["reasons"])
+
+
 def test_state_roundtrip_restores_compact_tables(tmp_path):
     state_path, db_path = tmp_path / "state.json", tmp_path / "runtime.duckdb"
     state = {"schema_version": 1, "jobs": {"url:https://jobs.example/1": {

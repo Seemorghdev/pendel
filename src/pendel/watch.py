@@ -286,7 +286,10 @@ class Runner:
             if value["status"] in ("match", "review"):
                 value["groups"] = "; ".join(sorted({x["group_id"] for x in value["match"]["group_tier_matches"]}))
                 value["tiers"] = "; ".join(sorted({x["tier"] for x in value["match"]["group_tier_matches"]}))
-            if first_observation and value["match"]["group_tier_matches"]:
+            # Tier-matched jobs with unresolved location/work mode are still
+            # actionable review alerts. Known exclusions never reach this path.
+            if first_observation and value["match"]["status"] in {"match", "review"} \
+                    and value["match"]["tier_candidates"]:
                 new_items.append(value)
 
         if new_items:
@@ -333,7 +336,7 @@ class Runner:
         return {"identity_key": value["identity_key"], "title": value["title"], "company": value["company"],
                 "url": value["url"], "status": tagged["status"],
                 "groups": sorted({x["group_id"] for x in tagged["group_tier_matches"]}),
-                "tiers": sorted({x["tier"] for x in tagged["group_tier_matches"]}),
+                "tiers": sorted(set(tagged["tier_candidates"])),
                 "reasons": tagged["reasons"]}
 
     @staticmethod

@@ -249,6 +249,10 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         remote_reasons.append("remote work country not stated")
     elif work_mode == "remote" and country != "DE":
         exclusions.append(f"remote work outside Germany ({country})")
+    # A recognized country outside Germany is decisive even when the feed
+    # omits a city or happens to mention a target city in another field.
+    elif country and country != "DE":
+        exclusions.append(f"job location outside Germany ({country})")
     remote_tiers = {str(x) for x in groups.get(config.get("remote_group_id", "09-remote-germany"), {}).get("tiers", [])}
     if remote_explicit and tier_hits and not (set(tier_hits) & remote_tiers):
         exclusions.append("job tier is not enabled for Germany remote searches")
