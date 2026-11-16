@@ -211,6 +211,14 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
 
 
 def _hours(job: dict[str, Any]) -> tuple[str, int | None]:
+    structured_hours = job.get("hours_per_week")
+    if isinstance(structured_hours, (int, float)) and not isinstance(structured_hours, bool):
+        if structured_hours > 0:
+            return "hours_listed", int(structured_hours)
+    elif isinstance(structured_hours, str) and re.fullmatch(r"\s*\d{1,3}(?:[.,]\d+)?\s*", structured_hours):
+        parsed_hours = float(structured_hours.strip().replace(",", "."))
+        if parsed_hours > 0:
+            return "hours_listed", int(parsed_hours)
     text = " ".join(str(job.get(k) or "") for k in
                     ("schedule", "hours", "hours_per_week", "employment_type", "title", "description", "description_text"))
     low = norm(text)

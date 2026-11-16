@@ -27,6 +27,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import duckdb
 
 from pendel import fetch
+from pendel.audit import write_delivery_receipt, write_rollups
 from pendel.targets import evaluate_job, load_config
 
 STATE_VERSION = 1
@@ -49,7 +50,8 @@ SOURCE_FIELDS = ["source_id", "ats", "token", "feed_url", "career_url", "compani
                  "source_groups", "source_tiers", "source_collections"]
 REPORT_FIELDS = ["status", "groups", "tiers", "company", "title", "location", "work_mode", "country",
                  "language_requirement_status", "german_level", "advert_language", "hours_status",
-                 "hours_per_week", "commute_status", "commute_note", "posted_at", "first_seen", "url", "reasons", "source_ids"]
+                 "hours_per_week", "commute_status", "commute_note", "posted_at", "first_seen", "url", "reasons", "source_ids",
+                 "identity_key", "observation"]
 
 
 def utc_now() -> datetime:
@@ -235,6 +237,10 @@ class Runner:
                     "country": str(item.get("country") or ""), "work_mode": str(item.get("work_mode") or ""),
                     "url": str(item.get("url") or ""), "posted_at": str(item.get("posted_at") or ""),
                     "salary": str(item.get("salary") or ""), "lang_hint": str(item.get("lang_hint") or ""),
+                    "employment_type": str(item.get("employment_type") or ""),
+                    "schedule": str(item.get("schedule") or ""),
+                    "hours": str(item.get("hours") or ""),
+                    "hours_per_week": str(item.get("hours_per_week") or ""),
                     "description": str(item.get("description") or ""), "source_ids": [source["source_id"]],
                 }
                 tagged = evaluate_job(value, self.config)
@@ -303,13 +309,17 @@ class Runner:
             if seen is None:
                 seen = {"first_seen": now, "last_seen": now, "source_ids": value["source_ids"]}
                 self.state["jobs"][ident] = seen
-                first_observation = any(baseline_before.get(sid, False) for sid in value["source_ids"])
-                if not first_observation:
+                has_prior_baseline = any(baseline_before.get(sid, False) for sid in value["source_ids"])
+                if has_prior_baseline:
+                    value["observation"] = "newly_seen"
+                else:
+                    value["observation"] = "baseline"
                     baseline_count += 1
             else:
                 seen["last_seen"] = now
                 seen["source_ids"] = sorted(set(seen.get("source_ids", []) + value["source_ids"]))
-                first_observation = False
+                has_prior_baseline = False
+                value["observation"] = "prior_seen"
             value["first_seen"] = seen["first_seen"]
             value["status"] = value["match"]["status"]
             if value["status"] in ("match", "review"):
@@ -317,17 +327,18 @@ class Runner:
                 value["tiers"] = "; ".join(sorted({x["tier"] for x in value["match"]["group_tier_matches"]}))
             # Tier-matched jobs with unresolved location/work mode are still
             # actionable review alerts. Known exclusions never reach this path.
-            if first_observation and value["match"]["status"] in {"match", "review"} \
+            if value["observation"] == "newly_seen" and value["match"]["status"] in {"match", "review"} \
                     and value["match"]["tier_candidates"]:
                 new_items.append(value)
 
         if new_items:
             outbox_id = "digest:" + hashlib.sha256((now + json.dumps([x["identity_key"] for x in new_items])).encode()).hexdigest()[:20]
             payload = {"items": [self._digest_item(x) for x in new_items]}
-            payload["chunks"] = self._telegram_chunks(payload)
+            payload["chunks"], chunk_item_ids = self._telegram_chunks_with_members(payload)
             self.state["outbox"].append({"outbox_id": outbox_id, "status": "pending", "created_at": now,
                                           "updated_at": now, "attempts": 0, "error": "",
                                           "chunk_statuses": ["pending"] * len(payload["chunks"]),
+                                          "chunk_item_ids": chunk_item_ids,
                                           "payload": payload})
 
         reports = {"match": [], "review": [], "exclude": []}
@@ -342,8 +353,22 @@ class Runner:
             reports[tagged["status"]].append(self._report_row(value))
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
+        snapshot_rows = [{
+            "identity_key": value["identity_key"], "source_ids": "; ".join(value["source_ids"]),
+            "company": value["company"], "job_id": value["job_id"], "title": value["title"], "location": value["location"],
+            "work_mode": value["work_mode"], "country": value["country"], "url": value["url"],
+            "posted_at": value["posted_at"], "salary": value["salary"], "lang_hint": value["lang_hint"],
+            "employment_type": value["employment_type"], "schedule": value["schedule"],
+            "hours": value["hours"], "hours_per_week": value["hours_per_week"],
+            "description": value["description"],
+        } for value in current.values()]
+        self._write_csv(output / "input-snapshot.csv", snapshot_rows,
+                        ["identity_key", "source_ids", "company", "job_id", "title", "location", "work_mode", "country",
+                         "url", "posted_at", "salary", "lang_hint", "employment_type", "schedule", "hours",
+                         "hours_per_week", "description"])
         for label, rows in reports.items():
             self._write_csv(output / f"{label}.csv", rows)
+        audit_summary = write_rollups(output, reports, snapshot_rows)
         self._write_csv(output / "source-status.csv", statuses, list(statuses[0]) if statuses else
                         ["source_id", "companies", "ats", "status", "error", "job_count", "complete"])
         summary = {
@@ -352,8 +377,9 @@ class Runner:
             "current_unique_listings": len(current), "first_seen": len(new_items),
             "silent_baseline_listings": baseline_count,
             "current_decisions": {key: len(rows) for key, rows in reports.items()},
+            "decision_audit": audit_summary,
             "telegram_outbox_pending": sum(1 for item in self.state["outbox"] if item["status"] == "pending"),
-            "delivery_enabled": False,
+            "delivery_status": "not_recorded_before_delivery_phase",
         }
         (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (output / "SUMMARY.md").write_text(self._markdown_summary(summary, reports), encoding="utf-8")
@@ -386,7 +412,8 @@ class Runner:
                 "commute_note": "Remote role" if tagged["work_mode"] == "remote" else
                                 "City-level group only; verify public-transport route to the exact worksite",
                 "posted_at": value["posted_at"], "first_seen": value["first_seen"], "url": value["url"],
-                "reasons": "; ".join(tagged["reasons"]), "source_ids": "; ".join(value["source_ids"])}
+                "reasons": "; ".join(tagged["reasons"]), "source_ids": "; ".join(value["source_ids"]),
+                "identity_key": value["identity_key"], "observation": value.get("observation", "not_recorded")}
 
     @staticmethod
     def _write_csv(path: Path, rows: list[dict], fields: list[str] | None = None) -> None:
@@ -412,8 +439,9 @@ class Runner:
         if summary.get("incomplete_sources"):
             lines.extend([f"- Incomplete sources: {summary['incomplete_sources']}; first-seen counts include completed sources only."])
         lines.extend(["",
-                 "## Notifications", "", "- Delivery is disabled in this run.",
-                 f"- Pending outbox messages: {summary['telegram_outbox_pending']}", ""])
+                 "## Notifications", "", "- This collection artifact is uploaded before delivery; delivery outcomes are not recorded here.",
+                 f"- Outbox messages pending at collection time: {summary['telegram_outbox_pending']}",
+                 "- See the separate post-delivery receipt artifact for persisted chunk outcomes.", ""])
         return "\n".join(lines)
 
     def claim(self) -> int:
@@ -510,12 +538,18 @@ class Runner:
 
     @staticmethod
     def _telegram_chunks(payload: dict, max_chars: int = 3900) -> list[str]:
+        return Runner._telegram_chunks_with_members(payload, max_chars)[0]
+
+    @staticmethod
+    def _telegram_chunks_with_members(payload: dict, max_chars: int = 3900) -> tuple[list[str], list[list[str]]]:
         items = payload.get("items", [])
         matches = [x for x in items if x.get("status") == "match"]
         reviews = [x for x in items if x.get("status") == "review"]
         header = f"New job watch — {len(matches)} matches, {len(reviews)} to review."
         chunks: list[str] = []
+        chunk_members: list[list[str]] = []
         current = header
+        current_members: list[str] = []
         current_section = ""
         for section, group in (("Matches", matches), ("Needs review", reviews)):
             for job in group:
@@ -532,7 +566,9 @@ class Runner:
                 prefix = "\n\n" + section + "\n" if current_section != section else "\n"
                 if len(current) + len(prefix) + len(entry) > max_chars and current != header:
                     chunks.append(current)
+                    chunk_members.append(current_members)
                     current = header + "\n(continued)"
+                    current_members = []
                     current_section = ""
                     prefix = "\n\n" + section + "\n"
                 if current_section != section:
@@ -541,19 +577,22 @@ class Runner:
                 else:
                     current += prefix
                 current += entry
+                current_members.append(str(job.get("identity_key", "")))
         if current != header:
             chunks.append(current)
-        return chunks or [header]
+            chunk_members.append(current_members)
+        return (chunks or [header], chunk_members or [[]])
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", required=True, choices=("prepare", "claim", "deliver"))
+    parser.add_argument("--phase", required=True, choices=("prepare", "claim", "deliver", "receipt"))
     parser.add_argument("--sources", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--state", required=True)
     parser.add_argument("--db", required=True)
     parser.add_argument("--output-dir", default="watch-report")
+    parser.add_argument("--report-dir", help="prepared report directory used by the receipt phase")
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--allow-send", action="store_true", help="requires PENDEL_TELEGRAM_APPROVED=true as well")
     parser.add_argument("--bootstrap", action="store_true", help="create empty state only for the intentional initial baseline")
@@ -566,9 +605,16 @@ def main() -> int:
             code = runner.prepare(load_sources(args.sources), args.output_dir)
         elif args.phase == "claim":
             code = runner.claim()
+        elif args.phase == "receipt":
+            if not args.report_dir:
+                raise ValueError("--report-dir is required for the receipt phase")
+            receipt = write_delivery_receipt(args.report_dir, state)
+            print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+            code = 0
         else:
             code = runner.deliver(args.allow_send)
-        write_state(args.state, state, args.db)
+        if args.phase != "receipt":
+            write_state(args.state, state, args.db)
         return code
     except Exception as exc:
         print(f"watch run failed: {type(exc).__name__}: {exc}", file=sys.stderr)

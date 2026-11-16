@@ -12,6 +12,7 @@ private source manifest -> public-feed readers -> first-seen state -> private ru
 - **Matching:** rules are loaded from a JSON file supplied by the caller. This package contains no personal location or role-target configuration.
 - **State:** the watcher imports a compact logical state export into DuckDB, tracks first-seen provider/tenant/listing IDs and feed health, and writes a new state export. A failed or partial feed cannot complete a baseline or mark jobs closed.
 - **Notifications:** the outbox is durable and delivery is opt-in. The Telegram adapter requires both an explicit command flag and an approval environment setting.
+- **Run artifacts:** collection writes decision reports, source health, a normalized private input snapshot (including descriptions), and unique-listing audit rollups. The rollups omit descriptions and listing URLs. After delivery, a separate receipt phase can record per-listing chunk outcomes from persisted state; the collection report itself does not claim delivery succeeded.
 
 ## Guardrails
 

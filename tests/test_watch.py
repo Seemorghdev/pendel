@@ -111,6 +111,10 @@ def test_initial_success_is_silent_baseline_then_new_job_is_queued(monkeypatch, 
     assert state["outbox"] == []
     assert state["sources"][source()["source_id"]]["baseline_complete"] is True
     assert json.loads((tmp_path / "first/summary.json").read_text())["silent_baseline_listings"] == 1
+    snapshot = list(csv.DictReader((tmp_path / "first/input-snapshot.csv").open()))
+    assert snapshot[0]["description"] == "English is required for this role."
+    assert snapshot[0]["identity_key"].startswith("id:greenhouse|acme|")
+    assert "delivery outcomes are not recorded" in (tmp_path / "first/SUMMARY.md").read_text()
 
     fetched.append(listing("two", title="Service Desk Agent", location="Demoville, Germany"))
     assert runner.prepare([source()], tmp_path / "second") == 0
@@ -133,6 +137,19 @@ def test_failed_or_partial_source_does_not_complete_baseline(monkeypatch, tmp_pa
     assert not state["jobs"]
     assert len(state["outbox"]) == 1
     assert "feed health notice" in state["outbox"][0]["payload"]["chunks"][0].lower()
+
+
+def test_structured_hours_survive_collection_for_audit_and_tier_filtering(monkeypatch, tmp_path):
+    item = listing("short-hours", title="Lagerhelfer", location="Exampleton, Germany")
+    item["hours_per_week"] = 20
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda *_args: [item])
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    Runner(config(), state).prepare([source()], tmp_path / "hours")
+    excluded = list(csv.DictReader((tmp_path / "hours/exclude.csv").open()))
+    assert excluded[0]["hours_status"] == "hours_listed"
+    assert excluded[0]["hours_per_week"] == "20"
+    snapshot = list(csv.DictReader((tmp_path / "hours/input-snapshot.csv").open()))
+    assert snapshot[0]["hours_per_week"] == "20"
 
 
 def test_feed_health_notice_is_quiet_until_change_and_reports_recovery(monkeypatch, tmp_path):
@@ -242,6 +259,80 @@ def test_telegram_digest_chunks_keep_every_listing_and_fit_limit():
     assert all(len(chunk) <= 900 for chunk in chunks)
     combined = "\n".join(chunks)
     assert all(f"Support listing {i}" in combined for i in range(30))
+    mapped_chunks, members = Runner._telegram_chunks_with_members({"items": items}, max_chars=900)
+    assert mapped_chunks == chunks
+    assert set(identity for chunk in members for identity in chunk) == {f"job-{i}" for i in range(30)}
+
+
+def test_audit_rollups_and_receipt_count_unique_listing_statuses_without_descriptions(tmp_path):
+    from pendel.audit import write_delivery_receipt, write_rollups
+
+    fields = ["status", "groups", "tiers", "company", "title", "location", "work_mode", "country",
+              "language_requirement_status", "hours_status", "reasons", "url", "identity_key", "observation"]
+    rows = {
+        "match": [{"status": "match", "groups": "area-a", "tiers": "1", "company": "Acme", "title": "A",
+                   "location": "Exampleton", "work_mode": "onsite", "country": "DE",
+                   "language_requirement_status": "explicit", "hours_status": "not_applicable", "reasons": "",
+                   "url": "https://jobs.example/a", "identity_key": "id:a", "observation": "newly_seen"}],
+        "review": [{"status": "review", "groups": "area-a", "tiers": "1", "company": "Acme", "title": "B",
+                    "location": "", "work_mode": "", "country": "", "language_requirement_status": "language_unclear",
+                    "hours_status": "hours_unclear", "reasons": "location unclear; work mode unclear", "url": "https://jobs.example/b",
+                    "identity_key": "id:b", "observation": "baseline"}],
+        "exclude": [{"status": "exclude", "groups": "", "tiers": "", "company": "Other", "title": "C",
+                     "location": "Foreign", "work_mode": "onsite", "country": "US", "language_requirement_status": "explicit",
+                     "hours_status": "not_applicable", "reasons": "outside Germany", "url": "https://jobs.example/c",
+                     "identity_key": "id:c", "observation": "newly_seen"}],
+    }
+    for status, values in rows.items():
+        with (tmp_path / f"{status}.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(values)
+    summary = write_rollups(tmp_path, rows, [{"identity_key": "id:a", "description": "private input text"}])
+    assert summary["unique_listings"] == 3
+    assert summary["missing_evidence"]["missing_location"] == 1
+    assert summary["missing_evidence"]["missing_description"] == 2
+    rollup = list(csv.DictReader((tmp_path / "audit-rollup.csv").open()))
+    area_match = next(row for row in rollup if row["dimension"] == "group" and row["value"] == "area-a" and row["status"] == "match")
+    assert area_match["unique_listings"] == "1"
+    assert "private input text" not in (tmp_path / "audit-summary.md").read_text()
+
+    state = {"outbox": [
+        {"outbox_id": "digest-1", "status": "sent", "payload": {"items": [{"identity_key": "id:a"}]},
+         "chunk_statuses": ["sent"], "chunk_item_ids": [["id:a"]]},
+    ]}
+    receipt = write_delivery_receipt(tmp_path, state)
+    assert receipt["notification_status_counts"] == {"not_recorded": 2, "sent": 1}
+    assert receipt["run_classification_counts"] == {"baseline": 1, "excluded": 1, "newly_eligible": 1}
+    receipt_text = (tmp_path / "notification-audit.csv").read_text()
+    assert "description" not in receipt_text.lower()
+    assert "synthetic-token" not in receipt_text
+
+
+def test_receipt_marks_ambiguous_pending_and_unrecorded_new_items(tmp_path):
+    from pendel.audit import write_delivery_receipt
+    fields = ["status", "company", "identity_key", "observation", "groups", "tiers", "reasons", "url"]
+    rows = [
+        {"status": "review", "company": "A", "identity_key": "pending", "observation": "newly_seen"},
+        {"status": "review", "company": "B", "identity_key": "uncertain", "observation": "newly_seen"},
+        {"status": "review", "company": "C", "identity_key": "absent", "observation": "newly_seen"},
+        {"status": "review", "company": "D", "identity_key": "prior", "observation": "prior_seen"},
+    ]
+    with (tmp_path / "review.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader(); writer.writerows(rows)
+    for status in ("match", "exclude"):
+        (tmp_path / f"{status}.csv").write_text("\n")
+    state = {"outbox": [
+        {"outbox_id": "p", "status": "pending", "payload": {"items": [{"identity_key": "pending"}]},
+         "chunk_statuses": ["pending"], "chunk_item_ids": [["pending"]]},
+        {"outbox_id": "a", "status": "ambiguous", "payload": {"items": [{"identity_key": "uncertain"}]},
+         "chunk_statuses": ["ambiguous"], "chunk_item_ids": [["uncertain"]]},
+    ]}
+    receipt = write_delivery_receipt(tmp_path, state)
+    assert receipt["notification_status_counts"] == {
+        "ambiguous": 1, "not_recorded": 2, "pending": 1,
+    }
+    assert receipt["run_classification_counts"] == {
+        "newly_eligible": 2, "not_recorded": 1, "prior_seen": 1,
+    }
 
 
 def test_claim_advances_one_persisted_chunk_at_a_time(monkeypatch):
