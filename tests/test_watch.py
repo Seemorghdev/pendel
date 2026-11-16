@@ -118,6 +118,9 @@ def test_initial_success_is_silent_baseline_then_new_job_is_queued(monkeypatch, 
 
     fetched.append(listing("two", title="Service Desk Agent", location="Demoville, Germany"))
     assert runner.prepare([source()], tmp_path / "second") == 0
+    second_summary = json.loads((tmp_path / "second/summary.json").read_text())
+    assert second_summary["newly_seen_listings"] == 1
+    assert second_summary["new_alert_candidates"] == 1
     assert len(state["outbox"]) == 1
     assert state["outbox"][0]["status"] == "pending"
     assert len(state["outbox"][0]["payload"]["items"]) == 1

@@ -375,6 +375,9 @@ class Runner:
             "run_at": now, "sources": len(sources), "source_status": dict(by_status),
             "incomplete_sources": sum(1 for status in statuses if not status["complete"]),
             "current_unique_listings": len(current), "first_seen": len(new_items),
+            "new_alert_candidates": len(new_items),
+            "newly_seen_listings": audit_summary["observation_counts"].get("newly_seen", 0),
+            "prior_seen_listings": audit_summary["observation_counts"].get("prior_seen", 0),
             "silent_baseline_listings": baseline_count,
             "current_decisions": {key: len(rows) for key, rows in reports.items()},
             "decision_audit": audit_summary,
@@ -433,7 +436,10 @@ class Runner:
                  "A city-group match is not a confirmed commute; verify public transport to the exact worksite.", "",
                  "## Feed health", "", f"- Sources: {summary['sources']}",
                  f"- Results: {json.dumps(summary['source_status'], sort_keys=True)}", "",
-                 "## First-seen baseline", "", f"- First observed in this run: {summary['first_seen']}",
+                 "## First-seen baseline", "",
+                 f"- Newly seen after an existing source baseline: {summary['newly_seen_listings']}",
+                 f"- Previously seen and still present: {summary['prior_seen_listings']}",
+                 f"- New eligible alert candidates: {summary['new_alert_candidates']}",
                  f"- Quiet initial baseline: {summary['silent_baseline_listings']}",
                  "- Failed or partial feeds do not complete a baseline or mark listings closed."]
         if summary.get("incomplete_sources"):
