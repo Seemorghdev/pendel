@@ -285,6 +285,14 @@ def _evidence_exclusions(job: dict[str, Any], config: dict[str, Any]) -> list[st
     return out
 
 
+def _review_title_exception(title: str, config: dict[str, Any]) -> str:
+    """Return a configured title exception that downgrades a senior exclusion to review."""
+    for pattern in config.get("review_title_exceptions", []):
+        if re.search(str(pattern), title, re.I):
+            return str(pattern)
+    return ""
+
+
 def _explicit_remote_region(location: str) -> str:
     """Recognize explicit non-Germany remote restrictions without guessing cities."""
     text = norm(location)
@@ -312,6 +320,9 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     language_status, german_level, language_reasons = _language(job, config)
     hour_status, hours, hours_max = _hours(job)
     exclusions = _evidence_exclusions(job, config)
+    review_title_exception = _review_title_exception(title, config)
+    if review_title_exception:
+        exclusions = [reason for reason in exclusions if not reason.startswith("senior:")]
     if work_mode == "remote" and not country:
         remote_region = _explicit_remote_region(str(job.get("location") or ""))
         if remote_region:
@@ -356,7 +367,7 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     reasons = []
     if not tier_hits:
         reasons.append("no configured tier phrase matched the title")
-    if not candidates:
+    if not candidates and tier_hits:
         if not city_matches and not remote_explicit:
             reasons.append("actual job location does not identify a configured city group")
         elif work_mode == "remote" and not country:
@@ -368,6 +379,8 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     for reason in language_reasons:
         if reason not in exclusions:
             reasons.append(reason)
+    if review_title_exception:
+        reasons.append("configured senior-title exception requires human review")
     below_threshold = False
     for tier in tier_hits:
         threshold = config.get("minimum_hours_by_tier", {}).get(tier)
