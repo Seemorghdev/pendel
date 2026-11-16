@@ -166,6 +166,27 @@ def test_german_compound_deutschkenntnisse_with_required_b2_is_excluded():
     assert any("German requirement exceeds" in reason for reason in result["reasons"])
 
 
+def test_verhandlungssichere_deutschkenntnisse_exceeds_b1_limit():
+    cfg = {
+        "remote_group_id": "remote",
+        "language_policy": {"allowed_languages": ["en", "de"], "max_german_level": "B1"},
+        "groups": {"area-a": {"cities": ["Exampleton"], "tiers": ["2"], "work_modes": ["onsite"]},
+                   "remote": {"cities": [], "tiers": [], "work_modes": ["remote"]}},
+        "tiers": {"2": {"phrases": ["Customer Support"]}},
+        "exclusions": {},
+    }
+    result = evaluate_job({
+        "title": "Customer Support Agent",
+        "location": "Exampleton, Germany",
+        "country": "DE",
+        "work_mode": "onsite",
+        "description": "Verhandlungssichere Deutschkenntnisse sind erforderlich.",
+    }, cfg)
+    assert result["language_requirement_status"] == "language_mismatch"
+    assert result["status"] == "exclude"
+    assert any("German requirement exceeds" in reason for reason in result["reasons"])
+
+
 def test_fluently_german_is_required_and_bonus_languages_are_optional():
     cfg = {
         "remote_group_id": "remote",

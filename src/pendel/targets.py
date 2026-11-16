@@ -128,7 +128,7 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
     level_rx = re.compile(r"\b([abc][12])\b", re.I)
     req_markers = re.compile(
         r"\b(required|required to|must|need to|proficient|fluent(?:ly)?|working language|language skills|"
-        r"kenntnisse|kenntnis|erforderlich|vorausgesetzt|verhandlungssicher|muttersprachlich|fliessend|fließend)\b|"
+        r"kenntnisse|kenntnis|erforderlich|vorausgesetzt|verhandlungssicher\w*|muttersprachlich|fliessend|fließend)\b|"
         r"deutschkenntnis(?:se|sen)?",
         re.I,
     )
@@ -142,7 +142,7 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
         re.I,
     )
     fluency = re.compile(
-        r"\b(fluent(?:ly)?|native|business fluent|near-native|verhandlungssicher|muttersprachlich|fliessend|fließend|excellent|very good|fluency)\b",
+        r"\b(fluent(?:ly)?|native|business fluent|near-native|verhandlungssicher\w*|muttersprachlich|fliessend|fließend|excellent|very good|fluency)\b",
         re.I,
     )
     fields = [
