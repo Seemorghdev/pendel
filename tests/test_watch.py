@@ -155,6 +155,13 @@ def test_structured_hours_survive_collection_for_audit_and_tier_filtering(monkey
     assert snapshot[0]["hours_per_week"] == "20"
 
 
+def test_structured_hours_accept_numeric_and_string_values():
+    from pendel.targets import _hours
+    assert _hours({"hours_per_week": 32}) == ("hours_listed", 32, 32)
+    assert _hours({"hours_per_week": 32.0}) == ("hours_listed", 32, 32)
+    assert _hours({"hours_per_week": "32"}) == ("hours_listed", 32, 32)
+
+
 def test_feed_health_notice_is_quiet_until_change_and_reports_recovery(monkeypatch, tmp_path):
     def offline(*_args):
         raise OSError("feed unavailable")
@@ -302,9 +309,11 @@ def test_audit_rollups_and_receipt_count_unique_listing_statuses_without_descrip
         {"outbox_id": "digest-1", "status": "sent", "payload": {"items": [{"identity_key": "id:a"}]},
          "chunk_statuses": ["sent"], "chunk_item_ids": [["id:a"]]},
     ]}
-    receipt = write_delivery_receipt(tmp_path, state)
-    assert receipt["notification_status_counts"] == {"not_recorded": 2, "sent": 1}
+    receipt = write_delivery_receipt(tmp_path, state, "no_send")
+    assert receipt["notification_status_counts"] == {"not_sent": 2, "sent": 1}
     assert receipt["run_classification_counts"] == {"baseline": 1, "excluded": 1, "newly_eligible": 1}
+    assert receipt["delivery_mode"] == "no_send"
+    assert receipt["observation_counts"] == {"baseline": 1, "newly_seen": 2}
     receipt_text = (tmp_path / "notification-audit.csv").read_text()
     assert "description" not in receipt_text.lower()
     assert "synthetic-token" not in receipt_text
@@ -329,13 +338,45 @@ def test_receipt_marks_ambiguous_pending_and_unrecorded_new_items(tmp_path):
         {"outbox_id": "a", "status": "ambiguous", "payload": {"items": [{"identity_key": "uncertain"}]},
          "chunk_statuses": ["ambiguous"], "chunk_item_ids": [["uncertain"]]},
     ]}
-    receipt = write_delivery_receipt(tmp_path, state)
+    receipt = write_delivery_receipt(tmp_path, state, "send_authorized")
     assert receipt["notification_status_counts"] == {
-        "ambiguous": 1, "not_recorded": 2, "pending": 1,
+        "ambiguous": 1, "not_recorded": 1, "not_sent": 1, "pending": 1,
     }
     assert receipt["run_classification_counts"] == {
-        "newly_eligible": 2, "not_recorded": 1, "prior_seen": 1,
+        "newly_eligible": 2, "not_eligible": 1, "prior_seen": 1,
     }
+    assert receipt["notification_reason_counts"] == {
+        "no eligible listing alert candidate": 1,
+        "no matching listing notification remains in retained outbox history": 1,
+        "persisted outbox outcome": 2,
+    }
+
+
+def test_receipt_separates_current_job_outbox_from_historical_health_notices(tmp_path):
+    from pendel.audit import write_delivery_receipt
+    fields = ["status", "company", "identity_key", "observation", "groups", "tiers", "reasons", "url"]
+    with (tmp_path / "review.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader()
+        writer.writerow({"status": "review", "company": "Acme", "identity_key": "job-1",
+                         "observation": "newly_seen", "tiers": "1"})
+    for status in ("match", "exclude"):
+        (tmp_path / f"{status}.csv").write_text("\n")
+    (tmp_path / "summary.json").write_text(json.dumps({"run_at": "2026-11-16T05:00:00Z", "new_alert_candidates": 1}))
+    state = {"outbox": [
+        {"outbox_id": "health:old", "status": "sent", "created_at": "2026-11-16T04:00:00Z",
+         "payload": {"items": [], "chunks": ["health"]}},
+        {"outbox_id": "digest:new", "status": "pending", "created_at": "2026-11-16T05:00:00Z",
+         "payload": {"items": [{"identity_key": "job-1"}], "chunks": ["job"]},
+         "chunk_statuses": ["pending"], "chunk_item_ids": [["job-1"]]},
+    ]}
+    receipt = write_delivery_receipt(tmp_path, state, "no_send")
+    assert receipt["eligible_job_alert_candidates"] == 1
+    assert receipt["current_run_job_notification_sends"] == 0
+    assert receipt["health_outbox_state_counts"] == {"sent": 1}
+    assert receipt["current_run_outbox_state_counts"] == {"job_digest:pending": 1}
+    row = next(csv.DictReader((tmp_path / "notification-audit.csv").open()))
+    assert row["notification_status"] == "pending"
+    assert row["outbox_period"] == "current_run"
 
 
 def test_claim_advances_one_persisted_chunk_at_a_time(monkeypatch):

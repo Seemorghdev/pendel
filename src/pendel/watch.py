@@ -50,7 +50,7 @@ SOURCE_FIELDS = ["source_id", "ats", "token", "feed_url", "career_url", "compani
                  "source_groups", "source_tiers", "source_collections"]
 REPORT_FIELDS = ["status", "groups", "tiers", "company", "title", "location", "work_mode", "country",
                  "language_requirement_status", "german_level", "advert_language", "hours_status",
-                 "hours_per_week", "commute_status", "commute_note", "posted_at", "first_seen", "url", "reasons", "source_ids",
+                 "hours_per_week", "hours_per_week_max", "commute_status", "commute_note", "posted_at", "first_seen", "url", "reasons", "source_ids",
                  "identity_key", "observation"]
 
 
@@ -411,6 +411,7 @@ class Runner:
                 "language_requirement_status": tagged["language_requirement_status"],
                 "german_level": tagged["german_level"], "advert_language": tagged["advert_language"],
                 "hours_status": tagged["hours_status"], "hours_per_week": tagged["hours_per_week"] or "",
+                "hours_per_week_max": tagged.get("hours_per_week_max") or "",
                 "commute_status": "remote" if tagged["work_mode"] == "remote" else "route_review",
                 "commute_note": "Remote role" if tagged["work_mode"] == "remote" else
                                 "City-level group only; verify public-transport route to the exact worksite",
@@ -599,6 +600,8 @@ def main() -> int:
     parser.add_argument("--db", required=True)
     parser.add_argument("--output-dir", default="watch-report")
     parser.add_argument("--report-dir", help="prepared report directory used by the receipt phase")
+    parser.add_argument("--delivery-mode", choices=("no_send", "send_authorized", "unknown"), default="unknown",
+                        help="delivery mode of the workflow that produced the receipt")
     parser.add_argument("--delay", type=float, default=2.0)
     parser.add_argument("--allow-send", action="store_true", help="requires PENDEL_TELEGRAM_APPROVED=true as well")
     parser.add_argument("--bootstrap", action="store_true", help="create empty state only for the intentional initial baseline")
@@ -614,7 +617,7 @@ def main() -> int:
         elif args.phase == "receipt":
             if not args.report_dir:
                 raise ValueError("--report-dir is required for the receipt phase")
-            receipt = write_delivery_receipt(args.report_dir, state)
+            receipt = write_delivery_receipt(args.report_dir, state, args.delivery_mode)
             print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
             code = 0
         else:

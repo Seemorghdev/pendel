@@ -148,6 +148,44 @@ def test_optional_german_b2_and_english_c1_keep_language_requirements_separate()
     assert any("preferred" in reason for reason in result["reasons"])
 
 
+def test_german_compound_deutschkenntnisse_with_required_b2_is_excluded():
+    cfg = {
+        "remote_group_id": "remote",
+        "language_policy": {"allowed_languages": ["en", "de"], "max_german_level": "B1"},
+        "groups": {"area-a": {"cities": ["Exampleton"], "tiers": ["3"], "work_modes": ["onsite"]},
+                   "remote": {"cities": [], "tiers": [], "work_modes": ["remote"]}},
+        "tiers": {"3": {"phrases": ["Lagerist"]}},
+        "exclusions": {},
+    }
+    result = evaluate_job({"title": "Lagerist", "location": "Exampleton, Germany", "country": "DE",
+                           "work_mode": "onsite", "language_requirement": "",
+                           "description": "Gute Deutschkenntnisse (mindestens B2) erforderlich."}, cfg)
+    assert result["language_requirement_status"] == "language_mismatch"
+    assert result["german_level"] == "B2"
+    assert result["status"] == "exclude"
+    assert any("German requirement exceeds" in reason for reason in result["reasons"])
+
+
+def test_fluently_german_is_required_and_bonus_languages_are_optional():
+    cfg = {
+        "remote_group_id": "remote",
+        "language_policy": {"allowed_languages": ["en", "de"], "max_german_level": "B1"},
+        "groups": {"area-a": {"cities": ["Exampleton"], "tiers": ["2"], "work_modes": ["onsite"]},
+                   "remote": {"cities": [], "tiers": [], "work_modes": ["remote"]}},
+        "tiers": {"2": {"phrases": ["Customer Support"]}},
+        "exclusions": {},
+    }
+    job = {"title": "Customer Support Agent", "location": "Exampleton, Germany", "country": "DE",
+           "work_mode": "onsite"}
+    required = evaluate_job(job | {"description": "Our staff communicate fluently in German and English."}, cfg)
+    assert required["language_requirement_status"] == "language_mismatch"
+    assert required["status"] == "exclude"
+
+    optional = evaluate_job(job | {"description": "German/French fluency is a bonus."}, cfg)
+    assert optional["language_requirement_status"] != "language_mismatch"
+    assert optional["status"] == "review"
+
+
 def test_tier_three_hours_threshold_accepts_32_excludes_20_and_reviews_unknown():
     cfg = {
         "remote_group_id": "remote",
@@ -163,6 +201,23 @@ def test_tier_three_hours_threshold_accepts_32_excludes_20_and_reviews_unknown()
     accepted = evaluate_job(base | {"schedule": "32 hours per week"}, cfg)
     below = evaluate_job(base | {"schedule": "20 hours per week"}, cfg)
     unclear = evaluate_job(base | {"schedule": "Part-time"}, cfg)
+    range_qualifies = evaluate_job(base | {"schedule": "30-40 h/Woche"}, cfg)
+    range_crosses = evaluate_job(base | {"schedule": "20–32 Stunden pro Woche"}, cfg)
+    range_below = evaluate_job(base | {"schedule": "20-29 h/Woche"}, cfg)
     assert accepted["status"] == "match"
     assert below["status"] == "exclude"
     assert unclear["status"] == "review"
+    assert range_qualifies["status"] == "match"
+    assert range_qualifies["hours_status"] == "hours_range"
+    assert range_qualifies["hours_per_week"] == 30
+    assert range_qualifies["hours_per_week_max"] == 40
+    assert range_crosses["status"] == "review"
+    assert "range crosses" in " ".join(range_crosses["reasons"])
+    assert range_below["status"] == "exclude"
+    assert range_below["hours_per_week_max"] == 29
+
+
+def test_hours_range_parser_accepts_hyphen_en_dash_and_h_per_week_forms():
+    from pendel.targets import _hours
+    assert _hours({"description": "30-40 h/Woche"}) == ("hours_range", 30, 40)
+    assert _hours({"description": "30–40 hours per week"}) == ("hours_range", 30, 40)

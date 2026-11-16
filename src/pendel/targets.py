@@ -116,16 +116,24 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
         "ru": ("russian", "russisch"), "el": ("greek", "griechisch"),
         "ro": ("romanian", "rumänisch", "rumaenisch"),
     }
-    lang_to_code = {alias: code for code, values in aliases.items() for alias in values}
-    lang_rx = re.compile(r"\b(" + "|".join(sorted(map(re.escape, lang_to_code), key=len, reverse=True)) + r")\b", re.I)
+    language_branches = []
+    for code, values in aliases.items():
+        for index, alias in enumerate(values):
+            if code == "de" and alias == "deutsch":
+                alias_pattern = r"\bdeutsch(?:kenntnis(?:se|sen)?)?\b"
+            else:
+                alias_pattern = rf"\b{re.escape(alias)}\b"
+            language_branches.append(f"(?P<lang_{code}_{index}>{alias_pattern})")
+    lang_rx = re.compile("|".join(language_branches), re.I)
     level_rx = re.compile(r"\b([abc][12])\b", re.I)
     req_markers = re.compile(
-        r"\b(required|required to|must|need to|proficient|fluent|working language|language skills|"
-        r"kenntnisse|kenntnis|erforderlich|vorausgesetzt|verhandlungssicher|muttersprachlich|fliessend|fließend)\b",
+        r"\b(required|required to|must|need to|proficient|fluent(?:ly)?|working language|language skills|"
+        r"kenntnisse|kenntnis|erforderlich|vorausgesetzt|verhandlungssicher|muttersprachlich|fliessend|fließend)\b|"
+        r"deutschkenntnis(?:se|sen)?",
         re.I,
     )
     optional_markers = re.compile(
-        r"\b(preferred|nice to have|an advantage|wünschenswert|wuenschenswert|von vorteil|accepted|acceptable|ausreichend)\b",
+        r"\b(preferred|nice to have|an advantage|wünschenswert|wuenschenswert|von vorteil|accepted|acceptable|ausreichend|bonus|bonuses)\b",
         re.I,
     )
     negated_markers = re.compile(
@@ -134,7 +142,7 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
         re.I,
     )
     fluency = re.compile(
-        r"\b(fluent|native|business fluent|near-native|verhandlungssicher|muttersprachlich|fliessend|fließend|excellent|very good|fluency)\b",
+        r"\b(fluent(?:ly)?|native|business fluent|near-native|verhandlungssicher|muttersprachlich|fliessend|fließend|excellent|very good|fluency)\b",
         re.I,
     )
     fields = [
@@ -149,6 +157,21 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
         if not raw:
             continue
         clauses = re.split(r"(?<=[.!?;\n])|\s+\band\b\s+|\s+\bund\b\s+|\s*,\s*", raw, flags=re.I)
+        merged_clauses: list[str] = []
+        for clause in clauses:
+            current_norm = norm(clause)
+            current_has_language = bool(lang_rx.search(current_norm))
+            current_has_level = bool(level_rx.search(current_norm))
+            if merged_clauses and len(current_norm) <= 100:
+                previous_norm = norm(merged_clauses[-1])
+                previous_has_language = bool(lang_rx.search(previous_norm))
+                previous_has_level = bool(level_rx.search(previous_norm))
+                if ((previous_has_language and not previous_has_level and current_has_level and not current_has_language)
+                        or (previous_has_level and not previous_has_language and current_has_language and not current_has_level)):
+                    merged_clauses[-1] += " " + clause
+                    continue
+            merged_clauses.append(clause)
+        clauses = merged_clauses
         for clause in clauses:
             normalized = norm(clause)
             hits = list(lang_rx.finditer(normalized))
@@ -166,7 +189,10 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
                     continue
                 optional = bool(optional_markers.search(context) or optional_markers.search(clause))
                 level = level_rx.search(context)
-                observations[lang_to_code[hit.group(1).casefold()]].append(
+                code = hit.lastgroup.split("_")[1] if hit.lastgroup else ""
+                if code not in observations:
+                    continue
+                observations[code].append(
                     (level.group(1).upper() if level else "", optional, context)
                 )
     reasons: list[str] = []
@@ -210,26 +236,40 @@ def _language(job: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, li
     return status, german_level, reasons
 
 
-def _hours(job: dict[str, Any]) -> tuple[str, int | None]:
+def _hours(job: dict[str, Any]) -> tuple[str, int | None, int | None]:
     structured_hours = job.get("hours_per_week")
     if isinstance(structured_hours, (int, float)) and not isinstance(structured_hours, bool):
         if structured_hours > 0:
-            return "hours_listed", int(structured_hours)
+            exact = int(structured_hours)
+            return "hours_listed", exact, exact
     elif isinstance(structured_hours, str) and re.fullmatch(r"\s*\d{1,3}(?:[.,]\d+)?\s*", structured_hours):
         parsed_hours = float(structured_hours.strip().replace(",", "."))
         if parsed_hours > 0:
-            return "hours_listed", int(parsed_hours)
+            exact = int(parsed_hours)
+            return "hours_listed", exact, exact
     text = " ".join(str(job.get(k) or "") for k in
                     ("schedule", "hours", "hours_per_week", "employment_type", "title", "description", "description_text"))
     low = norm(text)
+    ranges = re.findall(
+        r"\b(\d{1,3})\s*(?:-|–|—|to|bis)\s*(\d{1,3})\s*(?:hours?|h|std\.?|stunden|uur)"
+        r"\s*(?:(?:/|per|pro|a)\s*)?(?:week|woche|wk)?\b", low,
+    )
+    if ranges:
+        bounds = [(int(low_value), int(high_value)) for low_value, high_value in ranges
+                  if int(low_value) <= int(high_value)]
+        if bounds:
+            low_value = min(pair[0] for pair in bounds)
+            high_value = max(pair[1] for pair in bounds)
+            return "hours_range", low_value, high_value
     values = [int(n) for n in re.findall(r"\b(\d{1,2})\s*(?:hours?|std\.?|stunden|uur)\s*(?:per|pro|a)?\s*(?:week|woche)?\b", low)]
     if values:
-        return "hours_listed", max(values)
+        exact = max(values)
+        return "hours_listed", exact, exact
     if re.search(r"\b(full[- ]?time|vollzeit|temps plein)\b", low):
-        return "full_time", None
+        return "full_time", None, None
     if re.search(r"\b(part[- ]?time|teilzeit|minijob|aushilfe)\b", low):
-        return "part_time_unknown", None
-    return "hours_unclear", None
+        return "part_time_unknown", None, None
+    return "hours_unclear", None, None
 
 
 def _evidence_exclusions(job: dict[str, Any], config: dict[str, Any]) -> list[str]:
@@ -270,7 +310,7 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     work_mode = _mode(job)
     country = _country(job)
     language_status, german_level, language_reasons = _language(job, config)
-    hour_status, hours = _hours(job)
+    hour_status, hours, hours_max = _hours(job)
     exclusions = _evidence_exclusions(job, config)
     if work_mode == "remote" and not country:
         remote_region = _explicit_remote_region(str(job.get("location") or ""))
@@ -337,6 +377,14 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         if hour_status == "hours_listed" and hours is not None and hours < threshold:
             below_threshold = True
             reasons.append(f"Tier {tier} role lists fewer than the configured {threshold} hours per week")
+        elif hour_status == "hours_range" and hours is not None and hours_max is not None:
+            if hours >= threshold:
+                continue
+            if hours_max < threshold:
+                below_threshold = True
+                reasons.append(f"Tier {tier} role lists fewer than the configured {threshold} hours per week")
+            else:
+                reasons.append(f"Tier {tier} hours range crosses the configured {threshold}-hour minimum")
         elif hour_status in {"part_time_unknown", "hours_unclear"}:
             reasons.append(f"Tier {tier} hours/full-time status is unclear against the configured {threshold}-hour minimum")
         elif hour_status == "full_time":
@@ -381,5 +429,6 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
         "advert_language": ad_language,
         "hours_status": hour_status,
         "hours_per_week": hours,
+        "hours_per_week_max": hours_max,
         "reasons": reasons,
     }
