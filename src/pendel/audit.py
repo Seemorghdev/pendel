@@ -172,9 +172,15 @@ def write_delivery_receipt(output_dir: str | Path, state: dict, delivery_mode: s
                 identity = entry.get("identity_key", "")
                 if identity:
                     notification_by_identity[identity].append((status, item_id, period))
+    # Tier 1/2 listings waiting for the daily digest are recorded, not yet in the outbox.
+    for entry in state.get("digest_queue", []):
+        identity = entry.get("identity_key", "")
+        if identity:
+            period = "current_run" if run_at and str(entry.get("queued_at", "")) >= run_at else "prior_state"
+            notification_by_identity[identity].append(("queued_for_digest", "digest-queue", period))
 
     rows = []
-    precedence = {"ambiguous": 5, "failed_manual": 4, "sending": 3, "pending": 2, "sent": 1}
+    precedence = {"ambiguous": 5, "failed_manual": 4, "sending": 3, "pending": 2, "queued_for_digest": 2, "sent": 1}
     for raw in decision_rows:
         identity = _row_identity(raw)
         status = raw.get("status", "")
@@ -205,7 +211,7 @@ def write_delivery_receipt(output_dir: str | Path, state: dict, delivery_mode: s
             classification = "excluded"
         elif observation in {"baseline", "prior_seen"}:
             classification = observation
-        elif delivery_status in {"pending", "sent", "ambiguous", "sending", "failed_manual"}:
+        elif delivery_status in {"pending", "sent", "ambiguous", "sending", "failed_manual", "queued_for_digest"}:
             classification = "newly_eligible"
         elif delivery_status == "not_recorded":
             classification = "not_recorded"
@@ -242,12 +248,14 @@ def write_delivery_receipt(output_dir: str | Path, state: dict, delivery_mode: s
                "outbox_kind_state_counts": dict(sorted(outbox_kind_state_counts.items())),
                "current_run_outbox_state_counts": dict(sorted(current_run_outbox_counts.items())),
                "health_outbox_state_counts": dict(sorted(health_counts.items())),
+               "digest_queue_size": len(state.get("digest_queue", [])),
                "current_run_job_notification_sends": sum(
                    1 for row in rows if row["notification_status"] == "sent" and row["outbox_period"] == "current_run")}
     (output / "delivery-receipt.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     lines = ["# Post-delivery receipt", "", "This receipt reflects watcher state after the delivery phase. It is separate from the collection report uploaded before delivery.",
              f"Run mode: `{delivery_mode}`. `not_sent` means no listing notification was sent for the stated reason; `not_recorded` means a prior or eligible listing has no matching persisted notification record.",
              f"Eligible job alert candidates: {summary['eligible_job_alert_candidates']}; current-run job notification sends recorded: {summary['current_run_job_notification_sends']}.",
+             f"Listings waiting for the daily digest: {summary['digest_queue_size']}.",
              "", "## Listing notification states", ""]
     lines.extend(f"- Notification status — {key}: {value}" for key, value in sorted(counts.items()))
     lines.extend(f"- Notification reason — {key}: {value}" for key, value in sorted(reason_counts.items()))

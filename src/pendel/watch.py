@@ -16,17 +16,21 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from zoneinfo import ZoneInfo
 
 import duckdb
 
-from pendel import fetch
+from pendel import fetch, mail_alerts
 from pendel.audit import write_delivery_receipt, write_rollups
 from pendel.targets import evaluate_job, load_config
 
@@ -111,6 +115,14 @@ def load_sources(path: str | Path) -> list[dict[str, str]]:
     return [merged[k] for k in sorted(merged)]
 
 
+def canonical_url(url: str) -> str:
+    p = urlsplit(url.strip())
+    query = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if k.casefold() not in {"utm_source", "utm_medium", "utm_campaign", "gh_src"}]
+    return urlunsplit((p.scheme.casefold(), p.netloc.casefold(), p.path.rstrip("/"),
+                       urlencode(sorted(query)), ""))
+
+
 def identity_key(source: dict[str, str], item: dict) -> str:
     external_id = str(item.get("job_id") or "").strip()
     tenant = (source.get("token") or "").strip().casefold()
@@ -121,12 +133,7 @@ def identity_key(source: dict[str, str], item: dict) -> str:
         return f"id:{source['ats'].casefold()}|{tenant}|{external_id}"
     url = (item.get("url") or "").strip()
     if url:
-        p = urlsplit(url)
-        query = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
-                 if k.casefold() not in {"utm_source", "utm_medium", "utm_campaign", "gh_src"}]
-        canonical = urlunsplit((p.scheme.casefold(), p.netloc.casefold(), p.path.rstrip("/"),
-                                urlencode(sorted(query)), ""))
-        return "url:" + canonical
+        return "url:" + canonical_url(url)
     material = f"{source['ats']}|{tenant}|" + json.dumps(item, sort_keys=True, default=str)
     return "fallback:" + hashlib.sha256(material.encode()).hexdigest()
 
@@ -185,43 +192,103 @@ def write_state(path: str | Path, state: dict, db_path: str | Path) -> None:
             os.unlink(temp)
 
 
+def provider_key(url: str) -> str:
+    """Throttle and rate-limit key: the last two host labels, as fetch.HostThrottle uses."""
+    return ".".join((urlsplit(url).hostname or "").split(".")[-2:])
+
+
+class SharedThrottle:
+    """fetch.HostThrottle spacing, safe to share between fetch threads.
+
+    Requests to one provider key stay at least ``delay`` seconds apart even when
+    two threads reach the same key; different keys never wait for each other.
+    """
+
+    def __init__(self, delay: float):
+        self.delay = delay
+        self.last: dict[str, float] = {}
+        self._guard = threading.Lock()
+        self._locks: dict[str, threading.Lock] = {}
+
+    def wait(self, url: str) -> None:
+        key = provider_key(url)
+        with self._guard:
+            lock = self._locks.setdefault(key, threading.Lock())
+        with lock:
+            gap = time.monotonic() - self.last.get(key, 0.0)
+            if gap < self.delay:
+                time.sleep(self.delay - gap)
+            self.last[key] = time.monotonic()
+
+
 class Runner:
-    def __init__(self, config: dict, state: dict, delay: float = 2.0):
+    def __init__(self, config: dict, state: dict, delay: float = 2.0,
+                 clock: Callable[[], datetime] | None = None, workers: int = 1,
+                 mail: mail_alerts.MailClient | None = None):
         self.config = config
         self.state = state
-        self.throttle = fetch.HostThrottle(max(2.0, delay))
+        self.throttle = SharedThrottle(max(2.0, delay)) if workers > 1 else fetch.HostThrottle(max(2.0, delay))
+        self.clock = clock or utc_now
+        self.workers = max(1, workers)
+        self.mail = mail
+
+    def _fetch_source(self, source: dict[str, str], blocked: bool) -> tuple[str, str, list[dict], bool, bool]:
+        """Fetch every feed variant of one source. Returns status, error, jobs, complete, rate_limited."""
+        if blocked:
+            return "skipped_after_rate_limit", "provider host rate-limited earlier in this run", [], False, False
+        status, error, complete, limited = "ok", "", True, False
+        jobs: list[dict] = []
+        for variant_url in source.get("feed_urls") or [source["feed_url"]]:
+            try:
+                jobs.extend(fetch.fetch_jobs(source | {"feed_url": variant_url}, self.throttle))
+            except fetch.RateLimited as exc:
+                status, error, complete, limited = "rate_limited", str(exc), False, True
+                break
+            except fetch.IncompleteFeed as exc:
+                status, error, complete = "partial", str(exc), False
+            except urllib.error.HTTPError as exc:
+                status, error, complete = f"http_{exc.code}", str(exc.reason)[:200], False
+                if exc.code == 429:
+                    limited = True
+                    break
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                status, error, complete = "network_error", str(getattr(exc, "reason", exc))[:200], False
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                status, error, complete = "parse_error", f"{type(exc).__name__}: {exc}"[:200], False
+        return status, error, jobs, complete, limited
+
+    def _fetch_all(self, sources: list[dict[str, str]]) -> list[tuple[str, str, list[dict], bool, bool]]:
+        """Fetch results in source order. Each provider key is one sequential lane,
+        so a rate limit still skips the rest of that provider exactly as before;
+        with ``workers`` > 1 the lanes run side by side."""
+        lanes: dict[str, list[int]] = {}
+        for index, source in enumerate(sources):
+            lanes.setdefault(provider_key((source.get("feed_urls") or [source["feed_url"]])[0]), []).append(index)
+        results: list = [None] * len(sources)
+
+        def run_lane(indexes: list[int]) -> None:
+            blocked = False
+            for index in indexes:
+                results[index] = self._fetch_source(sources[index], blocked)
+                blocked = blocked or results[index][4]
+
+        if self.workers == 1:
+            blocked_keys: set[str] = set()
+            for index, source in enumerate(sources):
+                key = provider_key((source.get("feed_urls") or [source["feed_url"]])[0])
+                results[index] = self._fetch_source(source, key in blocked_keys)
+                if results[index][4]:
+                    blocked_keys.add(key)
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(lanes) or 1)) as pool:
+                for future in [pool.submit(run_lane, indexes) for indexes in lanes.values()]:
+                    future.result()
+        return results
 
     def collect(self, sources: list[dict[str, str]]) -> tuple[dict[str, dict], list[dict]]:
         current: dict[str, dict] = {}
         statuses: list[dict] = []
-        blocked_hosts: set[str] = set()
-        for source in sources:
-            urls = source.get("feed_urls") or [source["feed_url"]]
-            host = ".".join((urlsplit(urls[0]).hostname or "").split(".")[-2:])
-            status, error, jobs, complete = "ok", "", [], True
-            if host in blocked_hosts:
-                status, error, complete = "skipped_after_rate_limit", "provider host rate-limited earlier in this run", False
-            else:
-                all_variant_jobs: list[dict] = []
-                for variant_url in urls:
-                    try:
-                        all_variant_jobs.extend(fetch.fetch_jobs(source | {"feed_url": variant_url}, self.throttle))
-                    except fetch.RateLimited as exc:
-                        status, error, complete = "rate_limited", str(exc), False
-                        blocked_hosts.add(host)
-                        break
-                    except fetch.IncompleteFeed as exc:
-                        status, error, complete = "partial", str(exc), False
-                    except urllib.error.HTTPError as exc:
-                        status, error, complete = f"http_{exc.code}", str(exc.reason)[:200], False
-                        if exc.code == 429:
-                            blocked_hosts.add(host)
-                            break
-                    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                        status, error, complete = "network_error", str(getattr(exc, "reason", exc))[:200], False
-                    except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                        status, error, complete = "parse_error", f"{type(exc).__name__}: {exc}"[:200], False
-                jobs = all_variant_jobs
+        for source, (status, error, jobs, complete, _limited) in zip(sources, self._fetch_all(sources)):
             if status == "ok" and not jobs:
                 status = "empty"
             statuses.append({"source_id": source["source_id"], "companies": source["companies"],
@@ -230,33 +297,64 @@ class Runner:
             if not complete:
                 continue
             for item in jobs:
-                ident = identity_key(source, item)
-                value = {
-                    "identity_key": ident, "job_id": str(item.get("job_id") or ""), "company": source["companies"],
-                    "title": str(item.get("title") or ""), "location": str(item.get("location") or ""),
-                    "country": str(item.get("country") or ""), "work_mode": str(item.get("work_mode") or ""),
-                    "url": str(item.get("url") or ""), "posted_at": str(item.get("posted_at") or ""),
-                    "salary": str(item.get("salary") or ""), "lang_hint": str(item.get("lang_hint") or ""),
-                    "employment_type": str(item.get("employment_type") or ""),
-                    "schedule": str(item.get("schedule") or ""),
-                    "hours": str(item.get("hours") or ""),
-                    "hours_per_week": str(item.get("hours_per_week") or ""),
-                    "description": str(item.get("description") or ""), "source_ids": [source["source_id"]],
-                }
-                tagged = evaluate_job(value, self.config)
-                value["match"] = tagged
-                if ident in current:
-                    old = current[ident]
-                    old["source_ids"] = sorted(set(old["source_ids"] + value["source_ids"]))
-                    if len(value["description"]) > len(old["description"]):
-                        value["source_ids"] = old["source_ids"]
-                        current[ident] = value
-                else:
-                    current[ident] = value
+                self._add_job(current, source, item)
+        self._collect_email(current, statuses)
         return current, statuses
 
+    def _add_job(self, current: dict[str, dict], source: dict[str, str], item: dict,
+                 company: str | None = None) -> None:
+        ident = identity_key(source, item)
+        value = {
+            "identity_key": ident, "job_id": str(item.get("job_id") or ""),
+            "company": company or source["companies"],
+            "title": str(item.get("title") or ""), "location": str(item.get("location") or ""),
+            "country": str(item.get("country") or ""), "work_mode": str(item.get("work_mode") or ""),
+            "url": str(item.get("url") or ""), "posted_at": str(item.get("posted_at") or ""),
+            "salary": str(item.get("salary") or ""), "lang_hint": str(item.get("lang_hint") or ""),
+            "employment_type": str(item.get("employment_type") or ""),
+            "schedule": str(item.get("schedule") or ""),
+            "hours": str(item.get("hours") or ""),
+            "hours_per_week": str(item.get("hours_per_week") or ""),
+            "description": str(item.get("description") or ""), "source_ids": [source["source_id"]],
+        }
+        tagged = evaluate_job(value, self.config)
+        value["match"] = tagged
+        if ident in current:
+            old = current[ident]
+            old["source_ids"] = sorted(set(old["source_ids"] + value["source_ids"]))
+            if len(value["description"]) > len(old["description"]):
+                value["source_ids"] = old["source_ids"]
+                current[ident] = value
+        else:
+            current[ident] = value
+
+    def _collect_email(self, current: dict[str, dict], statuses: list[dict]) -> None:
+        """S6: jobs from employer alert emails, as one more source after the feeds.
+
+        A job whose link is already a feed job only adds this source to that job."""
+        settings = self.config.get("email_alerts")
+        if self.mail is None or not settings:
+            return
+        source = {"source_id": mail_alerts.SOURCE_ID, "ats": "email_alert", "token": "gmail",
+                  "feed_url": "", "companies": "Email job alerts"}
+        status, error, jobs, complete = mail_alerts.read_label(
+            self.mail, settings, self.state.setdefault("email_alerts", {}), lambda: iso(self.clock()))
+        statuses.append({"source_id": source["source_id"], "companies": source["companies"],
+                         "ats": source["ats"], "status": status, "error": error,
+                         "job_count": len(jobs), "complete": complete})
+        if not complete:
+            return
+        feed_by_url = {canonical_url(value["url"]): ident for ident, value in current.items() if value["url"]}
+        for item in jobs:
+            feed_ident = feed_by_url.get(canonical_url(item["url"]))
+            if feed_ident is not None:
+                known = current[feed_ident]
+                known["source_ids"] = sorted(set(known["source_ids"]) | {source["source_id"]})
+                continue
+            self._add_job(current, source, item, company=item["company"])
+
     def prepare(self, sources: list[dict[str, str]], output_dir: str | Path) -> int:
-        now = iso()
+        now = iso(self.clock())
         current, statuses = self.collect(sources)
         new_items: list[dict] = []
         baseline_count = 0
@@ -331,15 +429,7 @@ class Runner:
                     and value["match"]["tier_candidates"]:
                 new_items.append(value)
 
-        if new_items:
-            outbox_id = "digest:" + hashlib.sha256((now + json.dumps([x["identity_key"] for x in new_items])).encode()).hexdigest()[:20]
-            payload = {"items": [self._digest_item(x) for x in new_items]}
-            payload["chunks"], chunk_item_ids = self._telegram_chunks_with_members(payload)
-            self.state["outbox"].append({"outbox_id": outbox_id, "status": "pending", "created_at": now,
-                                          "updated_at": now, "attempts": 0, "error": "",
-                                          "chunk_statuses": ["pending"] * len(payload["chunks"]),
-                                          "chunk_item_ids": chunk_item_ids,
-                                          "payload": payload})
+        self._queue_alerts(new_items, now, statuses)
 
         reports = {"match": [], "review": [], "exclude": []}
         for value in current.values():
@@ -396,11 +486,174 @@ class Runner:
     @staticmethod
     def _digest_item(value: dict) -> dict:
         tagged = value["match"]
+        cities = [x["city"] for x in tagged["group_tier_matches"] if x.get("city")]
         return {"identity_key": value["identity_key"], "title": value["title"], "company": value["company"],
                 "url": value["url"], "status": tagged["status"],
                 "groups": sorted({x["group_id"] for x in tagged["group_tier_matches"]}),
                 "tiers": sorted(set(tagged["tier_candidates"])),
-                "reasons": tagged["reasons"]}
+                "reasons": tagged["reasons"],
+                "city": cities[0] if cities else str(value.get("location") or ""),
+                "salary": str(value.get("salary") or ""),
+                "hours_per_week": tagged.get("hours_per_week"),
+                "german_level": tagged.get("german_level", "")}
+
+    def _append_outbox(self, prefix: str, items: list[dict], chunks: list[str],
+                       chunk_item_ids: list[list[str]], now: str) -> None:
+        material = now + json.dumps([x.get("identity_key", "") for x in items])
+        self.state["outbox"].append({"outbox_id": prefix + hashlib.sha256(material.encode()).hexdigest()[:20],
+                                      "status": "pending", "created_at": now, "updated_at": now,
+                                      "attempts": 0, "error": "",
+                                      "chunk_statuses": ["pending"] * len(chunks),
+                                      "chunk_item_ids": chunk_item_ids,
+                                      "payload": {"items": items, "chunks": chunks}})
+
+    def _queue_alerts(self, new_items: list[dict], now: str, statuses: list[dict] | None = None) -> None:
+        """Route new listings to the outbox.
+
+        Without a ``delivery`` config block every run sends one combined digest,
+        as before. With it, ``instant_tiers`` listings go out in this run, one
+        message each; the rest wait in ``digest_queue`` for the first run after
+        ``digest_hour`` local time, which sends them as one daily digest. On
+        ``weekly_day`` the same run also sends a weekly summary.
+        """
+        delivery = self.config.get("delivery")
+        if not delivery:
+            if new_items:
+                payload = {"items": [self._digest_item(x) for x in new_items]}
+                chunks, members = self._telegram_chunks_with_members(payload)
+                self._append_outbox("digest:", payload["items"], chunks, members, now)
+            return
+
+        local = self.clock().astimezone(ZoneInfo(delivery.get("timezone", "Europe/Berlin")))
+        today = local.date().isoformat()
+        instant_tiers = {str(tier) for tier in delivery.get("instant_tiers", [])}
+        instant = [self._digest_item(x) for x in new_items if instant_tiers & set(x["match"]["tier_candidates"])]
+        instant_ids = {x["identity_key"] for x in instant}
+        if instant:
+            chunks = [self._instant_message(item, local) for item in instant]
+            self._append_outbox("instant:", instant, chunks, [[x["identity_key"]] for x in instant], now)
+        by_day = self.state.setdefault("instant_alerts_by_day", {})
+        by_day[today] = by_day.get(today, 0) + len(instant)
+
+        queue = self.state.setdefault("digest_queue", [])
+        queued = {x["identity_key"] for x in queue}
+        for value in new_items:
+            if value["identity_key"] not in instant_ids and value["identity_key"] not in queued:
+                queue.append(self._digest_item(value) | {"queued_at": now})
+
+        groups_today = self.state.setdefault("new_jobs_by_group_by_day", {}).setdefault(today, {})
+        for value in new_items:
+            for group in sorted({x["group_id"] for x in value["match"]["group_tier_matches"]}) or ["no group"]:
+                groups_today[group] = groups_today.get(group, 0) + 1
+        if statuses is not None:
+            runs = self.state.setdefault("runs_by_day", {})
+            runs[today] = runs.get(today, 0) + 1
+            failures = self.state.setdefault("source_failures_by_day", {}).setdefault(today, {})
+            for status in statuses:
+                if not status["complete"]:
+                    failures[status["source_id"]] = failures.get(status["source_id"], 0) + 1
+
+        due = local.hour >= int(delivery.get("digest_hour", 18))
+        if due and self.state.get("last_digest_date") != today:
+            if queue or by_day.get(today):
+                chunks, members = self._daily_digest_chunks(queue, local, by_day.get(today, 0))
+                self._append_outbox("daily:", list(queue), chunks, members, now)
+            self.state.setdefault("digest_items_by_day", {})[today] = len(queue)
+            self.state["digest_queue"] = []
+            self.state["last_digest_date"] = today
+
+        weekly_day = delivery.get("weekly_day")
+        if (weekly_day is not None and due and local.weekday() == int(weekly_day)
+                and self.state.get("last_weekly_date") != today):
+            labels = {s["source_id"]: f"{s.get('companies', '')} ({s.get('ats', '')})" for s in statuses or []}
+            message = self._weekly_message(self.state, local, labels)
+            self._append_outbox("weekly:", [], [message], [[]], now)
+            self.state["last_weekly_date"] = today
+
+        cutoff = (local.date() - timedelta(days=14)).isoformat()
+        for key in ("instant_alerts_by_day", "digest_items_by_day", "new_jobs_by_group_by_day",
+                    "runs_by_day", "source_failures_by_day"):
+            days = self.state.get(key, {})
+            for day in [d for d in days if d < cutoff]:
+                del days[day]
+
+    @staticmethod
+    def _weekly_message(state: dict, local: datetime, labels: dict[str, str]) -> str:
+        """Seven-day summary ending today, from counts kept by ``_queue_alerts``."""
+        week = {(local.date() - timedelta(days=n)).isoformat() for n in range(7)}
+        def total(key: str) -> int:
+            return sum(v for d, v in state.get(key, {}).items() if d in week)
+        groups: Counter = Counter()
+        failures: Counter = Counter()
+        for day in week:
+            groups.update(state.get("new_jobs_by_group_by_day", {}).get(day, {}))
+            failures.update(state.get("source_failures_by_day", {}).get(day, {}))
+        runs = total("runs_by_day")
+        failing = sorted((sid for sid, count in failures.items() if runs and count * 2 > runs),
+                         key=lambda sid: (-failures[sid], sid))
+        lines = [f"📊 WEEKLY · {local:%a %d %b}",
+                 f"Instant alerts sent: {total('instant_alerts_by_day')}",
+                 f"Jobs in daily digests: {total('digest_items_by_day')}"]
+        if groups:
+            ranked = sorted(groups.items(), key=lambda item: (-item[1], item[0]))
+            lines.append("New jobs by group: " + " · ".join(f"{g} {n}" for g, n in ranked)[:1500])
+            lines.append(f"Best group this week: {ranked[0][0]} ({ranked[0][1]})")
+        else:
+            lines.append("No new jobs this week.")
+        if failing:
+            shown = [f"{labels.get(sid, sid)[:120]} {failures[sid]}/{runs}" for sid in failing[:10]]
+            more = f" · plus {len(failing) - 10} more" if len(failing) > 10 else ""
+            lines.append("Feeds failing most runs: " + " · ".join(shown) + more)
+        return "\n".join(lines)[:3900]
+
+    @staticmethod
+    def _instant_message(item: dict, local: datetime) -> str:
+        tiers = " + ".join(item.get("tiers", [])) or "?"
+        groups = ", ".join(item.get("groups", []))
+        place = str(item.get("city") or "location not stated")[:200] + (f" ({groups[:200]})" if groups else "")
+        hours = item.get("hours_per_week")
+        lines = [f"🟢 TIER {tiers} · NEW · {local:%H:%M}",
+                 str(item.get("title", ""))[:350],
+                 f"{str(item.get('company', ''))[:250]} · {place}",
+                 f"💶 {str(item.get('salary') or 'not stated')[:120]}  ⏱ hours: {hours if hours else 'not stated'}",
+                 f"🗣 German: {item.get('german_level') or 'not stated'}"]
+        if item.get("status") == "review" and item.get("reasons"):
+            lines.append("Check: " + "; ".join(item["reasons"])[:350])
+        if item.get("url"):
+            lines.append(str(item["url"])[:1000])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
+                             max_chars: int = 3900) -> tuple[list[str], list[list[str]]]:
+        header = f"📋 DAILY DIGEST · {local:%a %d %b}"
+        footer = f"\n\nInstant alerts sent today: {instant_count}"
+        by_tier: dict[str, list[dict]] = {}
+        for item in items:
+            by_tier.setdefault(min(item.get("tiers") or ["?"]), []).append(item)
+        chunks: list[str] = []
+        members: list[list[str]] = []
+        current, current_members = header, []
+        for tier in sorted(by_tier):
+            jobs = sorted(by_tier[tier], key=lambda x: x.get("status") != "match")
+            section = f"\n\nTIER {tier} · {len(jobs)} new"
+            current += section
+            for job in jobs:
+                entry = (f"\n• {str(job.get('title', ''))[:300]} · {str(job.get('company', ''))[:200]}"
+                         f" · {str(job.get('city') or ', '.join(job.get('groups', [])))[:150]}")
+                if job.get("status") == "review" and job.get("reasons"):
+                    entry += "\n  check: " + "; ".join(job["reasons"])[:250]
+                if job.get("url"):
+                    entry += "\n  " + str(job["url"])[:1000]
+                if len(current) + len(entry) + len(footer) > max_chars and current_members:
+                    chunks.append(current)
+                    members.append(current_members)
+                    current, current_members = header + " (continued)" + section, []
+                current += entry
+                current_members.append(str(job.get("identity_key", "")))
+        chunks.append(current + footer)
+        members.append(current_members)
+        return chunks, members
 
     @staticmethod
     def _report_row(value: dict) -> dict:
@@ -603,13 +856,18 @@ def main() -> int:
     parser.add_argument("--delivery-mode", choices=("no_send", "send_authorized", "unknown"), default="unknown",
                         help="delivery mode of the workflow that produced the receipt")
     parser.add_argument("--delay", type=float, default=2.0)
+    parser.add_argument("--fetch-workers", type=int, default=1,
+                        help="fetch this many provider hosts side by side; each host keeps --delay spacing")
     parser.add_argument("--allow-send", action="store_true", help="requires PENDEL_TELEGRAM_APPROVED=true as well")
     parser.add_argument("--bootstrap", action="store_true", help="create empty state only for the intentional initial baseline")
     args = parser.parse_args()
     try:
         state = load_state(args.state, bootstrap=args.bootstrap)
         config = load_config(args.config)
-        runner = Runner(config, state, args.delay)
+        mail = None
+        if args.phase == "prepare" and config.get("email_alerts") and mail_alerts.configured():
+            mail = mail_alerts.GmailClient()
+        runner = Runner(config, state, args.delay, workers=args.fetch_workers, mail=mail)
         if args.phase == "prepare":
             code = runner.prepare(load_sources(args.sources), args.output_dir)
         elif args.phase == "claim":

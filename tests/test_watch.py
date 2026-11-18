@@ -476,3 +476,220 @@ def test_load_state_fails_closed_when_state_is_missing(tmp_path):
         pass
     else:
         raise AssertionError("missing persisted state must not silently become a fresh baseline")
+
+
+def delivery_config():
+    return config() | {"delivery": {"instant_tiers": ["3"], "digest_hour": 18, "timezone": "Europe/Berlin",
+                                    "weekly_day": 6}}
+
+
+def utc(text):
+    from datetime import datetime
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def test_tier3_is_sent_instantly_and_tier12_waits_for_the_evening_digest(monkeypatch, tmp_path):
+    fetched = [listing("one")]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _source, _throttle: list(fetched))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    now = [utc("2026-11-18T09:47:00Z")]
+    runner = Runner(delivery_config(), state, clock=lambda: now[0])
+    runner.prepare([source()], tmp_path / "baseline")
+
+    fetched += [listing("two", title="Lagerhelfer (m/w/d)"), listing("three", title="Service Desk Agent")]
+    runner.prepare([source()], tmp_path / "morning")
+    assert [item["outbox_id"].split(":")[0] for item in state["outbox"]] == ["instant"]
+    instant = state["outbox"][0]
+    assert len(instant["payload"]["chunks"]) == 1
+    assert instant["payload"]["chunks"][0].startswith("🟢 TIER 3 · NEW · 10:47")
+    assert "Lagerhelfer" in instant["payload"]["chunks"][0]
+    assert instant["chunk_item_ids"] == [[instant["payload"]["items"][0]["identity_key"]]]
+    assert [x["title"] for x in state["digest_queue"]] == ["Service Desk Agent"]
+
+    now[0] = utc("2026-11-18T17:47:00Z")
+    runner.prepare([source()], tmp_path / "evening")
+    daily = state["outbox"][-1]
+    assert daily["outbox_id"].startswith("daily:")
+    assert "TIER 1 · 1 new" in daily["payload"]["chunks"][0]
+    assert "Instant alerts sent today: 1" in daily["payload"]["chunks"][0]
+    assert state["digest_queue"] == []
+    assert state["last_digest_date"] == "2026-11-18"
+
+    now[0] = utc("2026-11-18T19:47:00Z")
+    runner.prepare([source()], tmp_path / "late")
+    assert len(state["outbox"]) == 2
+
+
+def test_listing_in_tier3_and_another_tier_is_sent_once_instantly(monkeypatch, tmp_path):
+    fetched = [listing("one")]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _source, _throttle: list(fetched))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    runner = Runner(delivery_config(), state, clock=lambda: utc("2026-11-18T09:47:00Z"))
+    runner.prepare([source()], tmp_path / "baseline")
+    fetched.append(listing("two", title="IT Support Lagerhelfer"))
+    runner.prepare([source()], tmp_path / "next")
+    assert len(state["outbox"]) == 1 and state["outbox"][0]["outbox_id"].startswith("instant:")
+    assert state["digest_queue"] == []
+
+
+def test_digest_hour_follows_berlin_time_across_daylight_saving():
+    queued = [{"identity_key": "job-1", "title": "Service Desk Agent", "company": "Acme",
+               "status": "match", "groups": ["area-a"], "tiers": ["1"], "url": "https://jobs.example/1"}]
+    for when, due in (("2026-07-01T16:30:00Z", True),    # 18:30 CEST
+                      ("2026-11-18T16:30:00Z", False),   # 17:30 CET
+                      ("2026-11-18T17:00:00Z", True)):   # 18:00 CET
+        state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [], "digest_queue": list(queued)}
+        runner = Runner(delivery_config(), state, clock=lambda when=when: utc(when))
+        runner._queue_alerts([], when)
+        assert bool(state["outbox"]) is due, when
+
+
+def test_without_delivery_config_every_run_still_sends_one_combined_digest(monkeypatch, tmp_path):
+    fetched = [listing("one")]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _source, _throttle: list(fetched))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    runner = Runner(config(), state, clock=lambda: utc("2026-11-18T09:47:00Z"))
+    runner.prepare([source()], tmp_path / "baseline")
+    fetched += [listing("two", title="Lagerhelfer"), listing("three", title="Service Desk Agent")]
+    runner.prepare([source()], tmp_path / "next")
+    assert len(state["outbox"]) == 1 and state["outbox"][0]["outbox_id"].startswith("digest:")
+    assert len(state["outbox"][0]["payload"]["items"]) == 2
+    assert "digest_queue" not in state
+
+
+def test_daily_digest_chunks_keep_every_listing_and_fit_limit():
+    items = [{"identity_key": f"job-{i}", "title": f"Support listing {i}", "company": "Example",
+              "url": f"https://jobs.example/{i}", "status": "match", "groups": ["area"], "tiers": [str(1 + i % 2)]}
+             for i in range(40)]
+    chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-18T17:47:00Z"), 3, max_chars=900)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 900 for chunk in chunks)
+    assert {identity for chunk in members for identity in chunk} == {f"job-{i}" for i in range(40)}
+    assert chunks[-1].endswith("Instant alerts sent today: 3")
+
+
+def test_receipt_shows_listings_waiting_for_the_digest(tmp_path):
+    from pendel.audit import write_delivery_receipt
+    fields = ["status", "company", "identity_key", "observation", "groups", "tiers", "reasons", "url"]
+    with (tmp_path / "match.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields); writer.writeheader()
+        writer.writerow({"status": "match", "company": "A", "identity_key": "waiting",
+                         "observation": "newly_seen", "tiers": "1"})
+    for status in ("review", "exclude"):
+        (tmp_path / f"{status}.csv").write_text("\n")
+    state = {"outbox": [], "digest_queue": [{"identity_key": "waiting", "queued_at": "2026-11-18T09:47:00Z"}]}
+    receipt = write_delivery_receipt(tmp_path, state, "no_send")
+    assert receipt["notification_status_counts"] == {"queued_for_digest": 1}
+    assert receipt["run_classification_counts"] == {"newly_eligible": 1}
+    assert receipt["digest_queue_size"] == 1
+
+
+def test_weekly_summary_is_sent_once_on_sunday_evening_with_seven_day_counts():
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [],
+             "instant_alerts_by_day": {"2026-11-20": 4, "2026-11-10": 99},
+             "digest_items_by_day": {"2026-11-20": 3},
+             "new_jobs_by_group_by_day": {"2026-11-20": {"area-a": 5, "area-b": 2}},
+             "runs_by_day": {"2026-11-20": 3},
+             "source_failures_by_day": {"2026-11-20": {"s-bad": 3, "s-ok": 1}}}
+    statuses = [{"source_id": "s-bad", "companies": "Bad Co", "ats": "personio", "complete": False},
+                {"source_id": "s-ok", "companies": "Ok Co", "ats": "lever", "complete": True}]
+    now = [utc("2026-11-21T17:47:00Z")]  # Saturday 18:47 CET
+    runner = Runner(delivery_config(), state, clock=lambda: now[0])
+    runner._queue_alerts([], "2026-11-21T17:47:00Z", statuses)
+    assert not any(x["outbox_id"].startswith("weekly:") for x in state["outbox"])
+
+    now[0] = utc("2026-11-22T17:47:00Z")  # Sunday 18:47 CET
+    runner._queue_alerts([], "2026-11-22T17:47:00Z", statuses)
+    weekly = [x for x in state["outbox"] if x["outbox_id"].startswith("weekly:")]
+    assert len(weekly) == 1
+    text = weekly[0]["payload"]["chunks"][0]
+    assert text.startswith("📊 WEEKLY · Sun 22 Nov")
+    assert "Instant alerts sent: 4" in text
+    assert "Jobs in daily digests: 3" in text
+    assert "Best group this week: area-a (5)" in text
+    assert "Bad Co (personio) 5/5" in text
+    assert "Ok Co" not in text
+
+    runner._queue_alerts([], "2026-11-22T19:47:00Z", statuses)
+    assert len([x for x in state["outbox"] if x["outbox_id"].startswith("weekly:")]) == 1
+
+
+def test_prepare_records_new_jobs_per_group_and_runs_per_day(monkeypatch, tmp_path):
+    fetched = [listing("one")]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _source, _throttle: list(fetched))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    runner = Runner(delivery_config(), state, clock=lambda: utc("2026-11-18T09:47:00Z"))
+    runner.prepare([source()], tmp_path / "baseline")
+    fetched.append(listing("two", title="Service Desk Agent"))
+    runner.prepare([source()], tmp_path / "next")
+    assert state["runs_by_day"] == {"2026-11-18": 2}
+    assert state["new_jobs_by_group_by_day"]["2026-11-18"] == {"area-a": 1}
+    assert state["source_failures_by_day"]["2026-11-18"] == {}
+
+
+def provider_source(company, host):
+    url = f"https://{company}.{host}/feed"
+    return source() | {"source_id": f"x|{url}", "token": company, "feed_url": url, "companies": company}
+
+
+def mixed_sources():
+    return [provider_source("alpha", "personio.de"), provider_source("beta", "greenhouse.io"),
+            provider_source("gamma", "personio.de"), provider_source("delta", "lever.co")]
+
+
+def test_parallel_collect_matches_sequential_collect(monkeypatch):
+    def fake_fetch(src, _throttle):
+        return [listing(f"{src['token']}-{n}") for n in range(2)]
+    monkeypatch.setattr(fetch, "fetch_jobs", fake_fetch)
+    sequential = Runner(config(), {"jobs": {}, "sources": {}, "outbox": []}).collect(mixed_sources())
+    parallel = Runner(config(), {"jobs": {}, "sources": {}, "outbox": []}, workers=8).collect(mixed_sources())
+    assert parallel == sequential
+    assert [s["source_id"] for s in parallel[1]] == [s["source_id"] for s in mixed_sources()]
+
+
+def test_parallel_lanes_overlap_across_providers(monkeypatch):
+    import threading
+    barrier = threading.Barrier(3, timeout=5)
+
+    def fake_fetch(src, _throttle):
+        if src["token"] in {"alpha", "beta", "delta"}:
+            barrier.wait()  # only passes if three providers are being fetched at the same time
+        return []
+    monkeypatch.setattr(fetch, "fetch_jobs", fake_fetch)
+    _current, statuses = Runner(config(), {"jobs": {}, "sources": {}, "outbox": []}, workers=8).collect(mixed_sources())
+    assert [s["status"] for s in statuses] == ["empty"] * 4
+
+
+def test_rate_limit_skips_only_the_same_provider_in_parallel(monkeypatch):
+    seen = []
+
+    def fake_fetch(src, _throttle):
+        seen.append(src["token"])
+        if src["token"] == "alpha":
+            raise fetch.RateLimited("alpha")
+        return [listing(src["token"])]
+    monkeypatch.setattr(fetch, "fetch_jobs", fake_fetch)
+    _current, statuses = Runner(config(), {"jobs": {}, "sources": {}, "outbox": []}, workers=8).collect(mixed_sources())
+    by_company = {s["companies"]: s["status"] for s in statuses}
+    assert by_company == {"alpha": "rate_limited", "beta": "ok", "gamma": "skipped_after_rate_limit", "delta": "ok"}
+    assert "gamma" not in seen
+
+
+def test_shared_throttle_spaces_same_provider_but_not_others(monkeypatch):
+    import threading
+    from pendel.watch import SharedThrottle
+    clock = [100.0]
+    sleeps = []
+    monkeypatch.setattr("pendel.watch.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("pendel.watch.time.sleep", lambda s: (sleeps.append(round(s, 2)), clock.__setitem__(0, clock[0] + s)))
+    throttle = SharedThrottle(2.0)
+    throttle.wait("https://a.jobs.personio.de/xml")
+    throttle.wait("https://boards-api.greenhouse.io/v1/boards/x/jobs")
+    throttle.wait("https://b.jobs.personio.de/xml")
+    assert sleeps == [2.0]
+    threads = [threading.Thread(target=throttle.wait, args=("https://c.jobs.personio.de/xml",)) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sleeps == [2.0, 2.0, 2.0, 2.0]
