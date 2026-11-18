@@ -693,3 +693,20 @@ def test_shared_throttle_spaces_same_provider_but_not_others(monkeypatch):
     for t in threads:
         t.join()
     assert sleeps == [2.0, 2.0, 2.0, 2.0]
+
+
+def test_connection_dropped_mid_response_fails_only_that_source(monkeypatch):
+    import http.client
+    other = source() | {"source_id": "greenhouse|other", "token": "other",
+                        "feed_url": "https://boards-api.greenhouse.io/v1/boards/other/jobs", "companies": "Other"}
+
+    def fetch_jobs(feed, _throttle):
+        if feed["token"] == "acme":
+            raise http.client.IncompleteRead(b"partial", 100)
+        return [listing("two")]
+    monkeypatch.setattr(fetch, "fetch_jobs", fetch_jobs)
+    current, statuses = Runner(config(), {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}).collect([source(), other])
+    assert [(s["source_id"], s["status"], s["complete"]) for s in statuses] == [
+        (source()["source_id"], "network_error", False), ("greenhouse|other", "ok", True)]
+    assert statuses[0]["error"] == "IncompleteRead"
+    assert len(current) == 1

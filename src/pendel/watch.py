@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -253,6 +254,10 @@ class Runner:
                     break
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 status, error, complete = "network_error", str(getattr(exc, "reason", exc))[:200], False
+            # http.client errors (IncompleteRead, BadStatusLine) are not OSErrors:
+            # a connection dropped mid-response must fail this source, not the run.
+            except http.client.HTTPException as exc:
+                status, error, complete = "network_error", type(exc).__name__, False
             except (ValueError, KeyError, TypeError, AttributeError) as exc:
                 status, error, complete = "parse_error", f"{type(exc).__name__}: {exc}"[:200], False
         return status, error, jobs, complete, limited
