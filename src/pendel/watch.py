@@ -779,7 +779,7 @@ class Runner:
                                "disable_web_page_preview": True}).encode(),
                                headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=20) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 result = json.loads(response.read().decode("utf-8"))
             if not result.get("ok"):
                 item["chunk_statuses"][index] = "failed_manual"
@@ -789,16 +789,33 @@ class Runner:
                 item["chunk_statuses"][index] = "sent"
                 item["status"] = "sent" if all(s == "sent" for s in item["chunk_statuses"]) else "pending"
                 item["error"] = ""
-        except (TimeoutError, urllib.error.URLError, OSError):
+        # HTTPError is a URLError (and an OSError), so it must be caught first. It means
+        # Telegram answered with an error, so the message was certainly not delivered.
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                # Rate limited: nothing was sent. Wait as asked and leave the chunk pending.
+                try:
+                    wait = int(json.loads(exc.read().decode("utf-8")).get("parameters", {}).get("retry_after", 5))
+                except (ValueError, OSError):
+                    wait = 5
+                time.sleep(min(max(wait, 1), 60))
+                item["chunk_statuses"][index] = "pending"
+                item["status"] = "pending"
+                item["error"] = f"Telegram rate limit (HTTP 429); waited {wait}s, will retry"
+            else:
+                item["chunk_statuses"][index] = "failed_manual"
+                item["status"] = "failed_manual"
+                item["error"] = f"Telegram rejected the request (HTTP {exc.code}); not delivered; review before retry"
+        except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
             item["chunk_statuses"][index] = "ambiguous"
             item["status"] = "ambiguous"
-            item["error"] = "delivery outcome uncertain; manual review required; no automatic retry"
-        except (urllib.error.HTTPError, ValueError):
+            item["error"] = f"delivery outcome uncertain ({type(exc).__name__}); manual review required; no automatic retry"
+        except ValueError:
             item["chunk_statuses"][index] = "failed_manual"
             item["status"] = "failed_manual"
-            item["error"] = "Telegram rejected the request; review before retry"
+            item["error"] = "Telegram response was not valid JSON; review before retry"
         item["updated_at"] = iso()
-        print(f"Telegram digest state recorded as {item['status']}.")
+        print(f"Telegram digest state recorded as {item['status']}. {item['error']}".rstrip())
         return 0
 
     @staticmethod

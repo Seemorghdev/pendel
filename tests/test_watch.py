@@ -710,3 +710,56 @@ def test_connection_dropped_mid_response_fails_only_that_source(monkeypatch):
         (source()["source_id"], "network_error", False), ("greenhouse|other", "ok", True)]
     assert statuses[0]["error"] == "IncompleteRead"
     assert len(current) == 1
+
+
+def _sending_state():
+    return {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [
+        {"outbox_id": "synthetic", "status": "sending", "chunk_index": 0,
+         "chunk_statuses": ["sending"], "payload": {"chunks": ["synthetic digest"]},
+         "attempts": 1, "created_at": "2026-11-15T12:00:00Z", "updated_at": "", "error": ""}]}
+
+
+def _raise_http(code, body=b'{"ok": false}'):
+    import io
+    import urllib.error
+
+    def opener(*_args, **_kwargs):
+        raise urllib.error.HTTPError("https://api.telegram.org", code, "error", {}, io.BytesIO(body))
+    return opener
+
+
+def test_telegram_error_answer_is_not_delivered_rather_than_ambiguous(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen", _raise_http(400))
+    state = _sending_state()
+    Runner(config(), state).deliver(allow_send=True)
+    assert state["outbox"][0]["status"] == "failed_manual"
+    assert "HTTP 400" in state["outbox"][0]["error"]
+
+
+def test_telegram_rate_limit_waits_and_leaves_the_chunk_pending(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen",
+                        _raise_http(429, b'{"ok": false, "parameters": {"retry_after": 3}}'))
+    slept = []
+    monkeypatch.setattr("pendel.watch.time.sleep", slept.append)
+    state = _sending_state()
+    Runner(config(), state).deliver(allow_send=True)
+    assert slept == [3]
+    assert state["outbox"][0]["status"] == "pending"
+    assert state["outbox"][0]["chunk_statuses"] == ["pending"]
+
+
+def test_ambiguous_error_names_the_exception(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()))
+    state = _sending_state()
+    Runner(config(), state).deliver(allow_send=True)
+    assert "(TimeoutError)" in state["outbox"][0]["error"]
