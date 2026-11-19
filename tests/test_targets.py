@@ -242,3 +242,53 @@ def test_hours_range_parser_accepts_hyphen_en_dash_and_h_per_week_forms():
     from pendel.targets import _hours
     assert _hours({"description": "30-40 h/Woche"}) == ("hours_range", 30, 40)
     assert _hours({"description": "30–40 hours per week"}) == ("hours_range", 30, 40)
+
+
+def _tier3_cfg(soft=True):
+    cfg = {
+        "remote_group_id": "remote",
+        "language_policy": {"allowed_languages": ["en", "de"], "max_german_level": "B1"},
+        "minimum_hours_by_tier": {"3": 30},
+        "groups": {
+            "area-a": {"cities": ["Exampleton"], "tiers": ["1", "3"], "work_modes": ["onsite"]},
+            "remote": {"cities": [], "tiers": ["1"], "work_modes": ["remote"]},
+        },
+        "tiers": {"1": {"phrases": ["Service Desk"]}, "3": {"phrases": ["Lagerhelfer"]}},
+        "exclusions": {},
+    }
+    if soft:
+        cfg["soft_review_reasons_by_tier"] = {"3": [
+            "required language not stated clearly", "German requirement level is unclear",
+            "work mode is unclear", "hours/full-time status is unclear",
+        ]}
+    return cfg
+
+
+def test_tier3_unclear_details_become_a_match_but_keep_their_reasons():
+    job = {"title": "Lagerhelfer (m/w/d)", "location": "Exampleton", "country": "DE"}
+    result = evaluate_job(job, _tier3_cfg())
+    assert result["status"] == "match"
+    assert any("hours" in reason for reason in result["reasons"])
+    assert evaluate_job(job, _tier3_cfg(soft=False))["status"] == "review"
+
+
+def test_soft_reasons_do_not_override_exclusions_or_other_tiers():
+    cfg = _tier3_cfg()
+    short = {"title": "Lagerhelfer", "location": "Exampleton", "country": "DE",
+             "work_mode": "onsite", "hours_per_week": 20}
+    assert evaluate_job(short, cfg)["status"] == "exclude"
+    tier1 = {"title": "Service Desk Agent", "location": "Exampleton", "country": "DE"}
+    assert evaluate_job(tier1, cfg)["status"] == "review"
+
+
+def test_germany_wide_group_matches_tier3_anywhere_in_germany_only():
+    cfg = _tier3_cfg()
+    cfg["groups"]["11-germany-tier3"] = {"anywhere_in_country": "DE", "tiers": ["3"], "work_modes": ["onsite"]}
+    far = {"title": "Lagerhelfer (m/w/d)", "location": "Ludwigsfelde, Brandenburg, Deutschland"}
+    result = evaluate_job(far, cfg)
+    assert result["status"] == "match"
+    assert result["group_tier_matches"] == [{"group_id": "11-germany-tier3", "tier": "3", "city": "Ludwigsfelde"}]
+    abroad = {"title": "Lagerhelfer", "location": "Wien", "country": "AT"}
+    assert evaluate_job(abroad, cfg)["status"] == "exclude"
+    tier1 = {"title": "Service Desk Agent", "location": "Ludwigsfelde", "country": "DE"}
+    assert evaluate_job(tier1, cfg)["status"] == "review"  # tier 1 still needs one of the 8 groups

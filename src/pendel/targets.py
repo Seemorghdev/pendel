@@ -308,6 +308,21 @@ def _explicit_remote_region(location: str) -> str:
     return next((name for name, pattern in regions if re.search(pattern, text, re.I)), "")
 
 
+def _soft_reasons(reasons: list[str], candidates: list[dict[str, str]], config: dict[str, Any]) -> set[str]:
+    """Reasons every matched tier has configured as informational rather than review-worthy.
+
+    Tier 3 adverts rarely state hours, German level or work mode; for those tiers
+    the reason is still reported but no longer holds the job back from a match.
+    """
+    rules = config.get("soft_review_reasons_by_tier", {})
+    tiers = {c["tier"] for c in candidates}
+    if not tiers or any(tier not in rules for tier in tiers):
+        return set()
+    return {reason for reason in reasons
+            if all(any(str(fragment).casefold() in reason.casefold() for fragment in rules[tier])
+                   for tier in tiers)}
+
+
 def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     """Return deterministic group/tier matches and an explicit review reason list."""
     title = str(job.get("title") or "")
@@ -352,6 +367,18 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
                 for tier in tier_hits:
                     if tier in {str(x) for x in spec.get("tiers", [])}:
                         candidates.append({"group_id": group_id, "tier": tier})
+            continue
+        if spec.get("anywhere_in_country"):
+            # Any on-site job in this country, for tiers where the owner will relocate.
+            wanted = str(spec["anywhere_in_country"]).upper()
+            in_country = country == wanted or (
+                not country and wanted == "DE"
+                and re.search(r"\b(germany|deutschland)\b|(?<![A-Za-z])DE(?![A-Za-z])", str(job.get("location") or ""), re.I))
+            if work_mode != "remote" and in_country:
+                for tier in tier_hits:
+                    if tier in {str(x) for x in spec.get("tiers", [])}:
+                        candidates.append({"group_id": group_id, "tier": tier,
+                                           "city": str(job.get("location") or "").split(",")[0].strip()})
             continue
         for city_group, city in city_matches:
             if city_group != group_id:
@@ -407,7 +434,7 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     if exclusions or below_threshold or not tier_hits:
         status = "exclude"
         candidates = []
-    elif reasons or not candidates:
+    elif not candidates or set(reasons) - _soft_reasons(reasons, candidates, config):
         status = "review"
     else:
         status = "match"
