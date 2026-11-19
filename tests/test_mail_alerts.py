@@ -202,3 +202,38 @@ def test_randstad_card_gives_a_clean_city_and_the_pay():
 def test_place_keeps_hyphenated_city_names():
     assert mail_alerts.place_in("Neu-Ulm · Vollzeit", "DHL") == "Neu-Ulm"
     assert mail_alerts.salary_in("ab 14,50 €/h brutto") == "ab 14,50 €/h"
+
+
+BA = {"name": "Jobbörse (BA)", "board": True, "job_hosts": ["arbeitsagentur.de"],
+      "job_paths": ["/jobsuche/jobdetail/"], "card_fields": ["company", "location"],
+      "redirect_hosts": [], "sender_domains": ["arbeitsagentur.de"]}
+
+
+def test_job_board_card_gives_the_real_employer_and_city():
+    html = ('<tr><td><a href="https://www.arbeitsagentur.de/jobsuche/jobdetail/10000-1234567890-S">'
+            "Helfer Lager (m/w/d)</a></td><td>Muster Logistik GmbH · 18.11.2026</td><td>Exampleton</td>"
+            '<td>Vollzeit</td></tr>'
+            '<tr><td><a href="https://www.arbeitsagentur.de/jobsuche/suche?was=Helfer">Alle Stellen</a></td></tr>'
+            '<tr><td><a href="https://www.arbeitsagentur.de/datenschutz">Datenschutz</a></td></tr>')
+    [job], _ = alert_jobs(mail(html=html, sender="BA <noreply@arbeitsagentur.de>"), EMPLOYERS + [BA])
+    assert (job["company"], job["location"]) == ("Muster Logistik GmbH", "Exampleton")
+    assert job["url"] == "https://www.arbeitsagentur.de/jobsuche/jobdetail/10000-1234567890-S"
+
+
+def test_job_board_link_outside_job_paths_is_not_a_job():
+    html = '<tr><td><a href="https://www.arbeitsagentur.de/jobsuche/suche?was=Lager">Lagerhelfer in Exampleton</a></td></tr>'
+    jobs, hosts = alert_jobs(mail(html=html, sender="BA <noreply@arbeitsagentur.de>"), [BA])
+    assert jobs == [] and hosts == {"www.arbeitsagentur.de"}
+
+
+def test_job_board_card_without_lines_falls_back_to_the_board_name():
+    text = "Lagerhelfer – Exampleton\nhttps://www.arbeitsagentur.de/jobsuche/jobdetail/10000-1-S\n"
+    [job], _ = alert_jobs(mail(text=text, sender="BA <noreply@arbeitsagentur.de>"), [BA])
+    assert job["company"] == "Jobbörse (BA)" and job["title"] == "Lagerhelfer – Exampleton"
+
+
+def test_employer_entries_keep_their_own_name():
+    html = ('<tr><td><a href="https://careers.dhl.com/job/9">Lagerhelfer (m/w/d)</a></td>'
+            "<td>Some Other GmbH</td><td>Exampleton</td></tr>")
+    [job], _ = alert_jobs(mail(html=html), EMPLOYERS + [BA])
+    assert job["company"] == "DHL"

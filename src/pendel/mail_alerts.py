@@ -4,6 +4,11 @@ Follows the private housing watcher's Gmail intake: read-only OAuth, a single
 label, allow-listed link hosts and processed-message tracking. It never opens
 job pages. Each allowed alert link becomes a job whose location and description
 come from the email text around it, and the normal matcher decides the rest.
+
+S10: an entry with "board": true is a job board (BA Jobbörse, Indeed, StepStone).
+Its cards name a different employer each time, so company and location are read
+from the card's text lines in the order given by "card_fields". "job_paths", when
+set, keeps only links whose path starts with one of them.
 """
 
 from __future__ import annotations
@@ -64,6 +69,20 @@ def place_in(context: str, employer: str) -> str:
         if len(word) >= 3:
             text = re.sub(re.escape(word), " ", text, flags=re.I)
     return _normal(re.sub(r"^[\s·|,:;–-]+|[\s·|,:;–-]+$", "", re.sub(r"(?:\s*[·|]\s*)+", " · ", text)))
+
+
+def board_fields(fragments: list[str], title: str, fields: list[str]) -> dict[str, str]:
+    """Company and location of a job-board card: its other text lines, in the configured order.
+
+    Lines that are only pay, a date or a button are skipped; "Acme GmbH · 18.11.2026" becomes "Acme GmbH"."""
+    lines = []
+    for fragment in fragments:
+        if fragment == title or BUTTON_RX.match(fragment):
+            continue
+        cleaned = place_in(fragment, "")
+        if len(cleaned) >= 2 and not SKIP_RX.search(cleaned):
+            lines.append(cleaned)
+    return {field: value for field, value in zip(fields, lines) if field}
 
 
 class MailClient(Protocol):
@@ -255,6 +274,9 @@ def alert_jobs(message: dict, employers: list[dict], received_at: str = "") -> t
             redirect = employer is not None
         if employer is None or p.path in ("", "/"):
             continue
+        paths = employer.get("job_paths", [])
+        if paths and not redirect and not any(p.path.startswith(x) for x in paths):
+            continue
         title = text
         if not title or BUTTON_RX.match(title):
             title = next((x for x in fragments if len(x) >= 4 and not BUTTON_RX.match(x) and not SKIP_RX.search(x)), "")
@@ -264,12 +286,18 @@ def alert_jobs(message: dict, employers: list[dict], received_at: str = "") -> t
         # A context this long is the whole email, not one job card. With no card
         # text, the title is the only place a city can be ("Lagerhelfer – Ulm").
         card = context if len(context) <= MAX_CONTEXT else ""
-        location = place_in(card, employer["name"]) or title
-        job = {"title": title, "company": employer["name"], "location": location, "url": url,
+        company = employer["name"]
+        if employer.get("board"):
+            found = board_fields(fragments if card else [], title, employer.get("card_fields", ["company", "location"]))
+            company = found.get("company") or employer["name"]
+            location = found.get("location") or place_in(card, company) or title
+        else:
+            location = place_in(card, company) or title
+        job = {"title": title, "company": company, "location": location, "url": url,
                "posted_at": received_at, "description": card or title, "salary": salary_in(card)}
         if redirect:
             # Click-tracking links differ per email; identify the job by its content.
-            material = "\x1f".join((employer["name"], title, location)).casefold()
+            material = "\x1f".join((company, title, location)).casefold()
             job["job_id"] = "mail-" + hashlib.sha256(material.encode()).hexdigest()[:20]
         prior = jobs.get(url)
         if prior is None or len(title) > len(prior["title"]):
