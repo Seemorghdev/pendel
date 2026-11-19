@@ -770,3 +770,49 @@ def test_ambiguous_error_names_the_exception(monkeypatch):
     state = _sending_state()
     Runner(config(), state).deliver(allow_send=True)
     assert "(TimeoutError)" in state["outbox"][0]["error"]
+
+
+def late_config(tier3_phrases=("Lagerhelfer",)):
+    cfg = delivery_config()
+    cfg["delivery"]["late_match_days"] = 7
+    cfg["tiers"] = cfg["tiers"] | {"3": {"phrases": list(tier3_phrases)}}
+    return cfg
+
+
+def test_recent_job_that_only_now_matches_is_sent_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _s, _t: [listing("k", title="Kommissionierer (m/w/d)")])
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    runner = Runner(late_config(), state, clock=lambda: utc("2026-11-18T09:47:00Z"))
+    runner.prepare([source()], tmp_path / "baseline")
+    assert state["outbox"] == [] and state["jobs"]["id:greenhouse|acme|k"]["alertable"] is False
+
+    runner.config = late_config(("Lagerhelfer", "Kommissionierer"))
+    runner.prepare([source()], tmp_path / "rule-change")
+    assert [x["outbox_id"].split(":")[0] for x in state["outbox"]] == ["instant"]
+    assert "Kommissionierer" in state["outbox"][0]["payload"]["chunks"][0]
+
+    runner.prepare([source()], tmp_path / "again")
+    assert len(state["outbox"]) == 1
+
+
+def test_backlog_from_before_the_change_goes_to_the_digest_not_instant(monkeypatch, tmp_path):
+    jobs = [listing("recent", title="Lagerhelfer A"), listing("old", title="Lagerhelfer B"),
+            listing("sent", title="Lagerhelfer C")]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda _s, _t: list(jobs))
+    key = "id:greenhouse|acme|"
+    state = {"schema_version": 1, "sources": {source()["source_id"]: {"baseline_complete": True}},
+             "jobs": {key + "recent": {"first_seen": "2026-11-16T10:00:00Z", "last_seen": "", "source_ids": []},
+                      key + "old": {"first_seen": "2026-11-05T10:00:00Z", "last_seen": "", "source_ids": []},
+                      key + "sent": {"first_seen": "2026-11-16T10:00:00Z", "last_seen": "", "source_ids": []}},
+             "outbox": [{"outbox_id": "instant:x", "status": "sent", "created_at": "2026-11-16T10:00:00Z",
+                         "updated_at": "2026-11-16T10:00:00Z", "attempts": 1, "error": "",
+                         "chunk_statuses": ["sent"], "chunk_item_ids": [[key + "sent"]],
+                         "payload": {"items": [{"identity_key": key + "sent"}], "chunks": ["x"]}}]}
+    runner = Runner(late_config(), state, clock=lambda: utc("2026-11-19T09:47:00Z"))
+    runner.prepare([source()], tmp_path / "first")
+    assert len(state["outbox"]) == 1
+    assert [x["title"] for x in state["digest_queue"]] == ["Lagerhelfer A"]
+    assert all(state["jobs"][key + x]["alertable"] is True for x in ("recent", "old", "sent"))
+
+    runner.prepare([source()], tmp_path / "second")
+    assert [x["title"] for x in state["digest_queue"]] == ["Lagerhelfer A"]

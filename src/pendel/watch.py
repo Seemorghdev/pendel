@@ -414,6 +414,10 @@ class Runner:
                 src_state["baseline_complete"] = True
             # A complete empty result is a valid success and completes baseline.
 
+        late_days = (self.config.get("delivery") or {}).get("late_match_days")
+        late_since = iso(self.clock() - timedelta(days=int(late_days))) if late_days else ""
+        already_sent = self._alerted_ids() if late_days else set()
+        catch_up: list[dict] = []
         for ident, value in current.items():
             seen = self.state["jobs"].get(ident)
             if seen is None:
@@ -437,10 +441,22 @@ class Runner:
                 value["tiers"] = "; ".join(sorted({x["tier"] for x in value["match"]["group_tier_matches"]}))
             # Tier-matched jobs with unresolved location/work mode are still
             # actionable review alerts. Known exclusions never reach this path.
-            if value["observation"] == "newly_seen" and value["match"]["status"] in {"match", "review"} \
-                    and value["match"]["tier_candidates"]:
+            alertable = value["match"]["status"] in {"match", "review"} and bool(value["match"]["tier_candidates"])
+            if value["observation"] == "newly_seen" and alertable:
                 new_items.append(value)
+            elif late_days and value["observation"] == "prior_seen" and alertable \
+                    and not seen.get("alertable") and seen["first_seen"] >= late_since \
+                    and ident not in already_sent:
+                # S11: a recent job that only now matches (e.g. after a rule change).
+                # Without a recorded earlier state it is backlog: one digest, not instant messages.
+                (new_items if "alertable" in seen else catch_up).append(value)
+            if late_days:
+                seen["alertable"] = alertable
 
+        if catch_up:
+            queue = self.state.setdefault("digest_queue", [])
+            queued = {x["identity_key"] for x in queue}
+            queue.extend(self._digest_item(x) | {"queued_at": now} for x in catch_up if x["identity_key"] not in queued)
         self._queue_alerts(new_items, now, statuses)
 
         reports = {"match": [], "review": [], "exclude": []}
@@ -508,6 +524,13 @@ class Runner:
                 "salary": str(value.get("salary") or ""),
                 "hours_per_week": tagged.get("hours_per_week"),
                 "german_level": tagged.get("german_level", "")}
+
+    def _alerted_ids(self) -> set[str]:
+        """Jobs already in any outbox message (sent, pending or cancelled) or waiting for the digest."""
+        ids = {x.get("identity_key", "") for x in self.state.get("digest_queue", [])}
+        for entry in self.state["outbox"]:
+            ids.update(x.get("identity_key", "") for x in entry.get("payload", {}).get("items", []))
+        return ids - {""}
 
     def _append_outbox(self, prefix: str, items: list[dict], chunks: list[str],
                        chunk_item_ids: list[list[str]], now: str) -> None:
