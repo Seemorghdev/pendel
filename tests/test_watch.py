@@ -138,6 +138,8 @@ def test_failed_or_partial_source_does_not_complete_baseline(monkeypatch, tmp_pa
     status = state["sources"][source()["source_id"]]
     assert status["baseline_complete"] is False
     assert not state["jobs"]
+    assert state["outbox"] == []  # one failed run is a blip, not a notice
+    runner.prepare([source()], tmp_path / "partial-again")
     assert len(state["outbox"]) == 1
     assert "feed health notice" in state["outbox"][0]["payload"]["chunks"][0].lower()
 
@@ -170,8 +172,10 @@ def test_feed_health_notice_is_quiet_until_change_and_reports_recovery(monkeypat
     runner = Runner(config(), state)
     monkeypatch.setattr(fetch, "fetch_jobs", offline)
     runner.prepare([source()], tmp_path / "failure-one")
-    assert len(state["outbox"]) == 1
+    assert state["outbox"] == []
     runner.prepare([source()], tmp_path / "failure-two")
+    assert len(state["outbox"]) == 1
+    runner.prepare([source()], tmp_path / "failure-three")
     assert len(state["outbox"]) == 1
 
     monkeypatch.setattr(fetch, "fetch_jobs", lambda *_args: [])
@@ -180,6 +184,8 @@ def test_feed_health_notice_is_quiet_until_change_and_reports_recovery(monkeypat
     assert "recovered" in state["outbox"][1]["payload"]["chunks"][0].lower()
 
     monkeypatch.setattr(fetch, "fetch_jobs", offline)
+    runner.prepare([source()], tmp_path / "blip")
+    assert len(state["outbox"]) == 2
     runner.prepare([source()], tmp_path / "failure-again")
     assert len(state["outbox"]) == 3
     assert "feed health notice" in state["outbox"][2]["payload"]["chunks"][0].lower()
@@ -501,7 +507,8 @@ def test_tier3_is_sent_instantly_and_tier12_waits_for_the_evening_digest(monkeyp
     assert [item["outbox_id"].split(":")[0] for item in state["outbox"]] == ["instant"]
     instant = state["outbox"][0]
     assert len(instant["payload"]["chunks"]) == 1
-    assert instant["payload"]["chunks"][0].startswith("🟢 TIER 3 · NEW · 10:47")
+    assert instant["payload"]["chunks"][0].startswith("🟢 T3 · Lagerhelfer")
+    assert "not stated" not in instant["payload"]["chunks"][0]
     assert "Lagerhelfer" in instant["payload"]["chunks"][0]
     assert instant["chunk_item_ids"] == [[instant["payload"]["items"][0]["identity_key"]]]
     assert [x["title"] for x in state["digest_queue"]] == ["Service Desk Agent"]
@@ -510,8 +517,8 @@ def test_tier3_is_sent_instantly_and_tier12_waits_for_the_evening_digest(monkeyp
     runner.prepare([source()], tmp_path / "evening")
     daily = state["outbox"][-1]
     assert daily["outbox_id"].startswith("daily:")
-    assert "TIER 1 · 1 new" in daily["payload"]["chunks"][0]
-    assert "Instant alerts sent today: 1" in daily["payload"]["chunks"][0]
+    assert "TIER 1 · 1" in daily["payload"]["chunks"][0]
+    assert "Instant Tier 3 alerts today: 1" in daily["payload"]["chunks"][0]
     assert state["digest_queue"] == []
     assert state["last_digest_date"] == "2026-11-18"
 
@@ -565,7 +572,7 @@ def test_daily_digest_chunks_keep_every_listing_and_fit_limit():
     assert len(chunks) > 1
     assert all(len(chunk) <= 900 for chunk in chunks)
     assert {identity for chunk in members for identity in chunk} == {f"job-{i}" for i in range(40)}
-    assert chunks[-1].endswith("Instant alerts sent today: 3")
+    assert chunks[-1].endswith("Instant Tier 3 alerts today: 3")
 
 
 def test_receipt_shows_listings_waiting_for_the_digest(tmp_path):

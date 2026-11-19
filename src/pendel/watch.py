@@ -366,9 +366,16 @@ class Runner:
         by_status = Counter()
         # Persist the set of currently degraded feeds so scheduled runs can
         # report transitions once, then stay quiet until the set changes or
-        # all feeds recover.
+        # all feeds recover. A feed counts as degraded only after failing two
+        # runs in a row, so one-off network blips send nothing.
+        streaks = self.state.setdefault("source_fail_streak", {})
+        for s in statuses:
+            streaks[s["source_id"]] = 0 if s["complete"] else streaks.get(s["source_id"], 0) + 1
+        for source_id in set(streaks) - {s["source_id"] for s in statuses}:
+            del streaks[source_id]
         prior_health = self.state.get("feed_health_signature", [])
-        degraded = sorted([s["source_id"], s["status"]] for s in statuses if not s["complete"])
+        degraded = sorted([s["source_id"], s["status"]] for s in statuses
+                          if not s["complete"] and streaks[s["source_id"]] >= 2)
         if degraded != prior_health:
             if degraded:
                 detail_by_id = {s["source_id"]: s for s in statuses}
@@ -612,18 +619,30 @@ class Runner:
         return "\n".join(lines)[:3900]
 
     @staticmethod
+    def _facts(item: dict) -> list[str]:
+        """Pay, hours and German level, only when the listing states them."""
+        facts = []
+        if item.get("salary"):
+            facts.append(f"💶 {str(item['salary'])[:120]}")
+        if item.get("hours_per_week"):
+            facts.append(f"⏱ {item['hours_per_week']} h/week")
+        if item.get("german_level"):
+            facts.append(f"🗣 German {str(item['german_level'])[:20]}")
+        return facts
+
+    @staticmethod
     def _instant_message(item: dict, local: datetime) -> str:
-        tiers = " + ".join(item.get("tiers", [])) or "?"
-        groups = ", ".join(item.get("groups", []))
-        place = str(item.get("city") or "location not stated")[:200] + (f" ({groups[:200]})" if groups else "")
-        hours = item.get("hours_per_week")
-        lines = [f"🟢 TIER {tiers} · NEW · {local:%H:%M}",
-                 str(item.get("title", ""))[:350],
-                 f"{str(item.get('company', ''))[:250]} · {place}",
-                 f"💶 {str(item.get('salary') or 'not stated')[:120]}  ⏱ hours: {hours if hours else 'not stated'}",
-                 f"🗣 German: {item.get('german_level') or 'not stated'}"]
+        tiers = "+".join(item.get("tiers", [])) or "?"
+        place = " · ".join(x for x in (str(item.get("city") or "")[:150], str(item.get("company") or "")[:150]) if x)
+        lines = [f"🟢 T{tiers} · {str(item.get('title', ''))[:300]}"]
+        if place:
+            lines.append(f"📍 {place}")
+        facts = Runner._facts(item)
+        if facts:
+            lines.append("  ".join(facts))
+        # A match may still carry informational reasons; only a review needs a look.
         if item.get("status") == "review" and item.get("reasons"):
-            lines.append("Check: " + "; ".join(item["reasons"])[:350])
+            lines.append("⚠️ " + "; ".join(item["reasons"][:2])[:250])
         if item.get("url"):
             lines.append(str(item["url"])[:1000])
         return "\n".join(lines)
@@ -631,8 +650,8 @@ class Runner:
     @staticmethod
     def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
                              max_chars: int = 3900) -> tuple[list[str], list[list[str]]]:
-        header = f"📋 DAILY DIGEST · {local:%a %d %b}"
-        footer = f"\n\nInstant alerts sent today: {instant_count}"
+        header = f"📋 {len(items)} new jobs · {local:%a %d %b}"
+        footer = f"\n\nInstant Tier 3 alerts today: {instant_count}" if instant_count else ""
         by_tier: dict[str, list[dict]] = {}
         for item in items:
             by_tier.setdefault(min(item.get("tiers") or ["?"]), []).append(item)
@@ -641,13 +660,17 @@ class Runner:
         current, current_members = header, []
         for tier in sorted(by_tier):
             jobs = sorted(by_tier[tier], key=lambda x: x.get("status") != "match")
-            section = f"\n\nTIER {tier} · {len(jobs)} new"
+            section = f"\n\nTIER {tier} · {len(jobs)}"
             current += section
             for job in jobs:
-                entry = (f"\n• {str(job.get('title', ''))[:300]} · {str(job.get('company', ''))[:200]}"
-                         f" · {str(job.get('city') or ', '.join(job.get('groups', [])))[:150]}")
+                place = " · ".join(x for x in (str(job.get("city") or ", ".join(job.get("groups", [])))[:120],
+                                               str(job.get("company", ""))[:120]) if x)
+                entry = f"\n• {str(job.get('title', ''))[:250]}"
+                detail = " · ".join([place] + Runner._facts(job)) if place else " · ".join(Runner._facts(job))
+                if detail:
+                    entry += f"\n  {detail}"
                 if job.get("status") == "review" and job.get("reasons"):
-                    entry += "\n  check: " + "; ".join(job["reasons"])[:250]
+                    entry += "\n  ⚠️ " + "; ".join(job["reasons"][:2])[:200]
                 if job.get("url"):
                     entry += "\n  " + str(job["url"])[:1000]
                 if len(current) + len(entry) + len(footer) > max_chars and current_members:

@@ -35,11 +35,35 @@ SKIP_RX = re.compile(
     r"suchauftrag|suche bearbeiten|edit search|facebook|instagram|linkedin|xing|youtube|tiktok)\b", re.I)
 # Button labels; the real title is elsewhere in the same card.
 BUTTON_RX = re.compile(
-    r"^(job ansehen|stelle ansehen|stellenanzeige ansehen|zum job|zur stelle|details|mehr erfahren|"
+    r"^(job ansehen|jetzt ansehen|stelle ansehen|stellenanzeige ansehen|zum job|zur stelle|details|mehr erfahren|"
     r"mehr informationen|jetzt bewerben|bewerben|view job|view details|see job|apply|apply now|"
     r"learn more|read more|ansehen|öffnen)$", re.I)
 URL_RX = re.compile(r"https?://[^\s<>\"']+")
 MAX_CONTEXT = 600
+_AMOUNT = r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?"
+# "€15.33 - €15.34 pro Stunde", "2.400 € brutto/Monat", "ab 14,50 €/h"
+SALARY_RX = re.compile(
+    rf"(?:ab\s+)?(?:€\s?{_AMOUNT}|{_AMOUNT}\s?(?:€|EUR))(?:\s*(?:-|–|bis)\s*(?:€\s?{_AMOUNT}|{_AMOUNT}\s?(?:€|EUR)?))?"
+    r"(?:\s*(?:brutto|netto))?(?:\s*(?:pro|/|je)\s*(?:Stunde|Std\.?|h|Monat|Jahr|Woche))?", re.I)
+DATE_RX = re.compile(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
+NOISE_RX = re.compile(r"\b(jetzt ansehen|jetzt bewerben|job ansehen|zum job|mehr erfahren|"
+                      r"job[- ]?id:?\s*\w+|vollzeit|teilzeit|minijob|befristet|unbefristet)\b", re.I)
+
+
+def salary_in(text: str) -> str:
+    found = SALARY_RX.search(text or "")
+    return _normal(found.group(0)) if found else ""
+
+
+def place_in(context: str, employer: str) -> str:
+    """The location part of an alert card: drops pay, dates, buttons and the employer name."""
+    text = SALARY_RX.sub(" ", context or "")
+    text = DATE_RX.sub(" ", text)
+    text = NOISE_RX.sub(" ", text)
+    for word in re.split(r"\s*/\s*", employer or ""):
+        if len(word) >= 3:
+            text = re.sub(re.escape(word), " ", text, flags=re.I)
+    return _normal(re.sub(r"^[\s·|,:;–-]+|[\s·|,:;–-]+$", "", re.sub(r"(?:\s*[·|]\s*)+", " · ", text)))
 
 
 class MailClient(Protocol):
@@ -239,9 +263,10 @@ def alert_jobs(message: dict, employers: list[dict], received_at: str = "") -> t
         context = _normal(" ".join(x for x in fragments if x != title and not BUTTON_RX.match(x)))
         # A context this long is the whole email, not one job card. With no card
         # text, the title is the only place a city can be ("Lagerhelfer – Ulm").
-        location = (context if len(context) <= MAX_CONTEXT else "") or title
+        card = context if len(context) <= MAX_CONTEXT else ""
+        location = place_in(card, employer["name"]) or title
         job = {"title": title, "company": employer["name"], "location": location, "url": url,
-               "posted_at": received_at, "description": location}
+               "posted_at": received_at, "description": card or title, "salary": salary_in(card)}
         if redirect:
             # Click-tracking links differ per email; identify the job by its content.
             material = "\x1f".join((employer["name"], title, location)).casefold()

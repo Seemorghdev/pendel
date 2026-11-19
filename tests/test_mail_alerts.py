@@ -164,6 +164,7 @@ def test_gmail_auth_failure_is_an_incomplete_source_with_a_health_notice(tmp_pat
     assert runner.prepare([], tmp_path / "run") == 0
     assert state["sources"][mail_alerts.SOURCE_ID]["baseline_complete"] is False
     assert state["sources"][mail_alerts.SOURCE_ID]["last_status"] == "auth_error"
+    assert runner.prepare([], tmp_path / "run-two") == 0  # notices need two failed runs in a row
     assert "Email job alerts (email_alert): auth_error" in state["outbox"][0]["payload"]["chunks"][0]
 
 
@@ -185,3 +186,19 @@ def test_unreadable_message_is_retried_next_run():
 def test_without_gmail_secrets_nothing_is_read():
     assert mail_alerts.configured({}) is False
     assert mail_alerts.configured({name: "x" for name in mail_alerts.SECRET_NAMES}) is True
+
+
+def test_randstad_card_gives_a_clean_city_and_the_pay():
+    randstad = EMPLOYERS + [{"name": "Randstad", "job_hosts": ["randstad.de"], "redirect_hosts": [], "sender_domains": []}]
+    html = ('<tr><td><a href="https://www.randstad.de/jobs/kommissionierer-mwd_krefeld_c01344457">Kommissionierer (m/w/d)</a></td>'
+            "<td>Randstad · 18/11/2026</td><td>Krefeld</td><td>€15.33 - €15.34 pro Stunde</td>"
+            '<td><a href="https://www.randstad.de/jobs/kommissionierer-mwd_krefeld_c01344457">Jetzt ansehen</a></td></tr>')
+    [job] = alert_jobs(mail(html=html, sender="Randstad <no-reply@randstad.de>"), randstad)[0]
+    assert job["location"] == "Krefeld"
+    assert job["salary"] == "€15.33 - €15.34 pro Stunde"
+    assert job["company"] == "Randstad"
+
+
+def test_place_keeps_hyphenated_city_names():
+    assert mail_alerts.place_in("Neu-Ulm · Vollzeit", "DHL") == "Neu-Ulm"
+    assert mail_alerts.salary_in("ab 14,50 €/h brutto") == "ab 14,50 €/h"
