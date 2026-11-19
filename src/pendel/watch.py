@@ -591,7 +591,8 @@ class Runner:
         due = local.hour >= int(delivery.get("digest_hour", 18))
         if due and self.state.get("last_digest_date") != today:
             if queue or by_day.get(today):
-                chunks, members = self._daily_digest_chunks(queue, local, by_day.get(today, 0))
+                chunks, members = self._daily_digest_chunks(queue, local, by_day.get(today, 0),
+                                                            speed=delivery.get("hire_speed"))
                 self._append_outbox("daily:", list(queue), chunks, members, now)
             self.state.setdefault("digest_items_by_day", {})[today] = len(queue)
             self.state["digest_queue"] = []
@@ -671,8 +672,23 @@ class Runner:
         return "\n".join(lines)
 
     @staticmethod
+    def _hire_speed(job: dict, speed: dict | None) -> int:
+        """S12: 0 = likely quick start (temp agency or no-qualification title), 1 = other
+        logistics/production work, 2 = the rest. Words come from ``delivery.hire_speed``."""
+        if not speed:
+            return 2
+        title = str(job.get("title") or "").casefold()
+        company = str(job.get("company") or "").casefold()
+        if any(str(x).casefold() in company for x in speed.get("fast_companies", [])) \
+                or any(str(x).casefold() in title for x in speed.get("fast_title_words", [])):
+            return 0
+        if any(str(x).casefold() in title for x in speed.get("medium_title_words", [])):
+            return 1
+        return 2
+
+    @staticmethod
     def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
-                             max_chars: int = 3900) -> tuple[list[str], list[list[str]]]:
+                             max_chars: int = 3900, speed: dict | None = None) -> tuple[list[str], list[list[str]]]:
         header = f"📋 {len(items)} new jobs · {local:%a %d %b}"
         footer = f"\n\nInstant Tier 3 alerts today: {instant_count}" if instant_count else ""
         by_tier: dict[str, list[dict]] = {}
@@ -682,13 +698,16 @@ class Runner:
         members: list[list[str]] = []
         current, current_members = header, []
         for tier in sorted(by_tier):
-            jobs = sorted(by_tier[tier], key=lambda x: x.get("status") != "match")
+            # Quickest hire first, then matches before reviews, stated pay first, then by city.
+            jobs = sorted(by_tier[tier], key=lambda x: (Runner._hire_speed(x, speed), x.get("status") != "match",
+                                                        not x.get("salary"), str(x.get("city") or "").casefold()))
             section = f"\n\nTIER {tier} · {len(jobs)}"
             current += section
             for job in jobs:
                 place = " · ".join(x for x in (str(job.get("city") or ", ".join(job.get("groups", [])))[:120],
                                                str(job.get("company", ""))[:120]) if x)
-                entry = f"\n• {str(job.get('title', ''))[:250]}"
+                mark = "⚡" if speed and Runner._hire_speed(job, speed) == 0 else "•"
+                entry = f"\n{mark} {str(job.get('title', ''))[:250]}"
                 detail = " · ".join([place] + Runner._facts(job)) if place else " · ".join(Runner._facts(job))
                 if detail:
                     entry += f"\n  {detail}"

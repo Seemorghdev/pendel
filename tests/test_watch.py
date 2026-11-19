@@ -816,3 +816,20 @@ def test_backlog_from_before_the_change_goes_to_the_digest_not_instant(monkeypat
 
     runner.prepare([source()], tmp_path / "second")
     assert [x["title"] for x in state["digest_queue"]] == ["Lagerhelfer A"]
+
+
+def test_digest_lists_quick_start_jobs_first_and_marks_them():
+    speed = {"fast_companies": ["Randstad"], "fast_title_words": ["helfer"], "medium_title_words": ["Lager"]}
+
+    def job(key, title, company="Example", status="match", salary="", city="Zeta"):
+        return {"identity_key": key, "title": title, "company": company, "status": status, "salary": salary,
+                "city": city, "url": f"https://jobs.example/{key}", "groups": ["area"], "tiers": ["3"]}
+    items = [job("office", "Bürokraft"), job("lager", "Lagermitarbeiter"),
+             job("review", "Produktionshelfer", status="review"), job("helfer", "Produktionshelfer", city="Alpha"),
+             job("agency", "Mitarbeiter Versand", company="Randstad", salary="€15 pro Stunde")]
+    chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-18T17:47:00Z"), 0, speed=speed)
+    assert members == [["agency", "helfer", "review", "lager", "office"]]
+    assert "⚡ Mitarbeiter Versand" in chunks[0] and "• Bürokraft" in chunks[0]
+
+    _, plain = Runner._daily_digest_chunks(items, utc("2026-11-18T17:47:00Z"), 0)
+    assert plain[0][-1] == "review"
