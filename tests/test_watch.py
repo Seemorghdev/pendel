@@ -854,3 +854,13 @@ def test_quick_start_jobs_of_all_tiers_lead_the_digest():
     chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-20T17:00:00Z"), 0, speed=speed)
     assert members == [["h3", "it", "o3"]]
     assert chunks[0].index("⚡ QUICK START · 1") < chunks[0].index("TIER 1 · 1") < chunks[0].index("TIER 3 · 1")
+
+
+def test_foreign_review_places_are_skipped_but_german_towns_without_country_are_kept():
+    delivery = {"alert_countries": ["DE", "NL"], "skip_review_places": ["Bangalore", "New York", "Bristol"]}
+    assert Runner._foreign_place("", "Bangalore", delivery)
+    assert Runner._foreign_place("", "New York City", delivery)
+    assert Runner._foreign_place("GB", "Somewhere", delivery)
+    assert not Runner._foreign_place("", "Worms", delivery)
+    assert not Runner._foreign_place("DE", "Berlin", delivery)
+    assert not Runner._foreign_place("", "Bangalore", {})

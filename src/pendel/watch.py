@@ -475,11 +475,9 @@ class Runner:
             # Tier-matched jobs with unresolved location/work mode are still
             # actionable review alerts. Known exclusions never reach this path.
             alertable = value["match"]["status"] in {"match", "review"} and bool(value["match"]["tier_candidates"])
-            # S13: a review job in a known country outside delivery.alert_countries is not worth a message.
-            countries = (self.config.get("delivery") or {}).get("alert_countries")
-            country = str(value["match"].get("country") or "").upper()
-            if alertable and countries and value["match"]["status"] == "review" and country \
-                    and country not in {str(x).upper() for x in countries}:
+            if alertable and value["match"]["status"] == "review" and self._foreign_place(
+                    value["match"].get("country") or value.get("country"), value.get("location"),
+                    self.config.get("delivery") or {}):
                 alertable = False
             if value["observation"] == "newly_seen" and alertable:
                 new_items.append(value)
@@ -563,6 +561,19 @@ class Runner:
                 "salary": str(value.get("salary") or ""),
                 "hours_per_week": tagged.get("hours_per_week"),
                 "german_level": tagged.get("german_level", "")}
+
+    @staticmethod
+    def _foreign_place(country, location, delivery: dict) -> bool:
+        """S13/S13b: a review job that is clearly abroad isn't worth a message. Either its country is
+        known and outside delivery.alert_countries, or (as for most foreign listings, which state no
+        country) its location names one of delivery.skip_review_places."""
+        country = str(country or "").upper()
+        allowed = {str(x).upper() for x in delivery.get("alert_countries", [])}
+        if allowed and country and country not in allowed:
+            return True
+        place = str(location or "")
+        return any(re.search(rf"(?<!\w){re.escape(str(x))}(?!\w)", place, re.I)
+                   for x in delivery.get("skip_review_places", []))
 
     def _alerted_ids(self) -> set[str]:
         """Jobs already in any outbox message (sent, pending or cancelled) or waiting for the digest."""
