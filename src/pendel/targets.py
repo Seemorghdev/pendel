@@ -293,6 +293,15 @@ def _review_title_exception(title: str, config: dict[str, Any]) -> str:
     return ""
 
 
+def _country_rules(config: dict[str, Any]) -> tuple[set[str], set[str], list[str]]:
+    """S14: allowed on-site countries, allowed remote countries, and remote region words
+    ("EU", "Europe", "EMEA"). The defaults keep the original Germany-only behaviour."""
+    rules = config.get("countries") or {}
+    allowed = {str(x).upper() for x in rules.get("allowed", ["DE"])}
+    remote = {str(x).upper() for x in rules.get("remote_allowed", ["DE"])}
+    return allowed | {"DE"}, remote | {"DE"}, [str(x) for x in rules.get("remote_regions", [])]
+
+
 def _explicit_remote_region(location: str) -> str:
     """Recognize explicit non-Germany remote restrictions without guessing cities."""
     text = norm(location)
@@ -338,24 +347,31 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     review_title_exception = _review_title_exception(title, config)
     if review_title_exception:
         exclusions = [reason for reason in exclusions if not reason.startswith("senior:")]
-    if work_mode == "remote" and not country:
-        remote_region = _explicit_remote_region(str(job.get("location") or ""))
-        if remote_region:
-            exclusions.append(f"remote eligibility restricted outside Germany ({remote_region})")
     if language_status == "language_mismatch":
         exclusions.extend(language_reasons)
 
-    # A specific country allowance is required for a Germany-remote match.
+    # S14: which countries count is config, not a fixed "DE". Without a "countries" block
+    # the rules are exactly as before (Germany only, Germany-remote only).
+    allowed_countries, remote_countries, remote_regions = _country_rules(config)
+    where = "Germany" if allowed_countries == {"DE"} else "allowed countries"
+    remote_region_ok = bool(remote_regions) and work_mode == "remote" and not country and bool(
+        re.search("|".join(rf"(?<!\w){re.escape(x)}(?!\w)" for x in remote_regions), str(job.get("location") or ""), re.I))
+    if work_mode == "remote" and not country and not remote_region_ok:
+        remote_region = _explicit_remote_region(str(job.get("location") or ""))
+        if remote_region:
+            exclusions.append(f"remote eligibility restricted outside Germany ({remote_region})")
+
+    # A specific country allowance is required for a remote match.
     remote_reasons: list[str] = []
-    remote_explicit = work_mode == "remote" and country == "DE"
-    if work_mode == "remote" and not country:
+    remote_explicit = work_mode == "remote" and (country in remote_countries or remote_region_ok)
+    if work_mode == "remote" and not country and not remote_region_ok:
         remote_reasons.append("remote work country not stated")
-    elif work_mode == "remote" and country != "DE":
-        exclusions.append(f"remote work outside Germany ({country})")
-    # A recognized country outside Germany is decisive even when the feed
+    elif work_mode == "remote" and country and country not in remote_countries:
+        exclusions.append(f"remote work outside {where} ({country})")
+    # A recognized country outside the allowed ones is decisive even when the feed
     # omits a city or happens to mention a target city in another field.
-    elif country and country != "DE":
-        exclusions.append(f"job location outside Germany ({country})")
+    elif work_mode != "remote" and country and country not in allowed_countries:
+        exclusions.append(f"job location outside {where} ({country})")
     remote_tiers = {str(x) for x in groups.get(config.get("remote_group_id", "09-remote-germany"), {}).get("tiers", [])}
     if remote_explicit and tier_hits and not (set(tier_hits) & remote_tiers):
         exclusions.append("job tier is not enabled for Germany remote searches")
@@ -369,10 +385,11 @@ def evaluate_job(job: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
                         candidates.append({"group_id": group_id, "tier": tier})
             continue
         if spec.get("anywhere_in_country"):
-            # Any on-site job in this country, for tiers where the owner will relocate.
-            wanted = str(spec["anywhere_in_country"]).upper()
-            in_country = country == wanted or (
-                not country and wanted == "DE"
+            # Any on-site job in these countries, for tiers where the owner will relocate.
+            raw = spec["anywhere_in_country"]
+            wanted = {str(x).upper() for x in (raw if isinstance(raw, list) else [raw])}
+            in_country = country in wanted or (
+                not country and "DE" in wanted
                 and re.search(r"\b(germany|deutschland)\b|(?<![A-Za-z])DE(?![A-Za-z])", str(job.get("location") or ""), re.I))
             if work_mode != "remote" and in_country:
                 for tier in tier_hits:

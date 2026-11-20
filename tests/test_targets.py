@@ -292,3 +292,48 @@ def test_germany_wide_group_matches_tier3_anywhere_in_germany_only():
     assert evaluate_job(abroad, cfg)["status"] == "exclude"
     tier1 = {"title": "Service Desk Agent", "location": "Ludwigsfelde", "country": "DE"}
     assert evaluate_job(tier1, cfg)["status"] == "review"  # tier 1 still needs one of the 8 groups
+
+
+def _europe_cfg():
+    return {
+        "remote_group_id": "remote",
+        "language_policy": {"allowed_languages": ["en", "de"], "max_german_level": "B1"},
+        "countries": {"allowed": ["DE", "NL", "ES"], "remote_allowed": ["DE", "NL", "ES", "FR"],
+                      "remote_regions": ["EU", "Europe", "EMEA"]},
+        "groups": {
+            "remote": {"cities": [], "tiers": ["1"], "work_modes": ["remote"]},
+            "europe": {"anywhere_in_country": ["NL", "ES"], "tiers": ["1"], "work_modes": ["onsite", "hybrid"]},
+        },
+        "tiers": {"1": {"phrases": ["IT Support"]}},
+        "exclusions": {},
+    }
+
+
+def test_europe_group_takes_onsite_jobs_in_listed_countries_only():
+    cfg = _europe_cfg()
+    barcelona = evaluate_job({"title": "IT Support Analyst", "location": "Barcelona", "country": "ES",
+                           "work_mode": "onsite"}, cfg)
+    assert barcelona["group_tier_matches"] == [{"group_id": "europe", "tier": "1", "city": "Barcelona"}]
+    paris = evaluate_job({"title": "IT Support Analyst", "location": "Paris", "country": "FR", "work_mode": "onsite"}, cfg)
+    assert paris["status"] == "exclude"
+    assert any("outside allowed countries (FR)" in r for r in paris["reasons"])
+
+
+def test_remote_jobs_in_eu_countries_or_eu_regions_match_the_remote_group():
+    cfg = _europe_cfg()
+    for job in ({"title": "IT Support", "location": "Remote, France", "country": "FR", "work_mode": "remote"},
+                {"title": "IT Support", "location": "Remote - EMEA", "work_mode": "remote"},
+                {"title": "IT Support", "location": "Europe (Remote)", "work_mode": "remote"}):
+        assert evaluate_job(job, cfg)["group_tier_matches"] == [{"group_id": "remote", "tier": "1"}], job
+    us = evaluate_job({"title": "IT Support", "location": "Remote (US)", "country": "US", "work_mode": "remote"}, cfg)
+    assert us["status"] == "exclude"
+
+
+def test_without_a_countries_block_germany_rules_are_unchanged():
+    cfg = _europe_cfg()
+    del cfg["countries"]
+    result = evaluate_job({"title": "IT Support", "location": "Dublin", "country": "IE", "work_mode": "onsite"}, cfg)
+    assert result["status"] == "exclude"
+    assert any("outside Germany (IE)" in r for r in result["reasons"])
+    eu = evaluate_job({"title": "IT Support", "location": "Remote - EMEA", "work_mode": "remote"}, cfg)
+    assert eu["group_tier_matches"] == []
