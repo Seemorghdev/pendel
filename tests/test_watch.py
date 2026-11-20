@@ -833,3 +833,24 @@ def test_digest_lists_quick_start_jobs_first_and_marks_them():
 
     _, plain = Runner._daily_digest_chunks(items, utc("2026-11-18T17:47:00Z"), 0)
     assert plain[0][-1] == "review"
+
+
+def test_pay_text_reads_schema_org_values_and_saved_strings():
+    from pendel.watch import pay_text
+    saved = "{'@type': 'QuantitativeValue', 'maxValue': 2600, 'minValue': 2488, 'unitText': 'MONTH'}"
+    assert pay_text(saved) == "2,488–2,600 €/month"
+    assert pay_text({"@type": "MonetaryAmount", "currency": "EUR",
+                     "value": {"@type": "QuantitativeValue", "value": 15.5, "unitText": "HOUR"}}) == "15.5 €/hour"
+    assert pay_text("€15.33 - €15.34 pro Stunde") == "€15.33 - €15.34 pro Stunde"
+    assert pay_text("{broken") == "{broken" and pay_text(None) == ""
+    assert Runner._facts({"salary": saved}) == ["💶 2,488–2,600 €/month"]
+
+
+def test_quick_start_jobs_of_all_tiers_lead_the_digest():
+    speed = {"fast_title_words": ["helfer"]}
+    items = [{"identity_key": "it", "title": "IT Support", "status": "match", "tiers": ["1"], "url": "u1"},
+             {"identity_key": "h3", "title": "Lagerhelfer", "status": "match", "tiers": ["3"], "url": "u2"},
+             {"identity_key": "o3", "title": "Bürokraft", "status": "match", "tiers": ["3"], "url": "u3"}]
+    chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-20T17:00:00Z"), 0, speed=speed)
+    assert members == [["h3", "it", "o3"]]
+    assert chunks[0].index("⚡ QUICK START · 1") < chunks[0].index("TIER 1 · 1") < chunks[0].index("TIER 3 · 1")

@@ -9,6 +9,7 @@ Each invocation restores it into a fresh DuckDB file before processing.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import hashlib
 import http.client
@@ -122,6 +123,38 @@ def canonical_url(url: str) -> str:
              if k.casefold() not in {"utm_source", "utm_medium", "utm_campaign", "gh_src"}]
     return urlunsplit((p.scheme.casefold(), p.netloc.casefold(), p.path.rstrip("/"),
                        urlencode(sorted(query)), ""))
+
+
+PAY_UNITS = {"HOUR": "hour", "DAY": "day", "WEEK": "week", "MONTH": "month", "YEAR": "year"}
+
+
+def pay_text(value) -> str:
+    """S13: readable pay. A schema.org MonetaryAmount/QuantitativeValue (a dict, or the
+    str() of one already saved in state) becomes e.g. "2,488–2,600 €/month"."""
+    if isinstance(value, str) and value.lstrip().startswith("{"):
+        try:
+            value = ast.literal_eval(value.strip())
+        except (ValueError, SyntaxError):
+            return value.strip()
+    if not isinstance(value, dict):
+        return str(value or "").strip()
+    inner = value.get("value") if isinstance(value.get("value"), dict) else value
+    currency = str(value.get("currency") or inner.get("currency") or "EUR").upper()
+    unit = PAY_UNITS.get(str(inner.get("unitText") or value.get("unitText") or "").upper(), "")
+
+    def amount(x):
+        try:
+            number = float(str(x).replace(",", "."))
+        except (TypeError, ValueError):
+            return ""
+        return f"{number:,.2f}".rstrip("0").rstrip(".") if number < 100 else f"{number:,.0f}"
+    low, high = amount(inner.get("minValue")), amount(inner.get("maxValue"))
+    single = amount(inner.get("value")) if not isinstance(inner.get("value"), dict) else ""
+    span = f"{low}–{high}" if low and high and low != high else (low or high or single)
+    if not span:
+        return ""
+    symbol = "€" if currency == "EUR" else currency
+    return f"{span} {symbol}" + (f"/{unit}" if unit else "")
 
 
 def identity_key(source: dict[str, str], item: dict) -> str:
@@ -315,7 +348,7 @@ class Runner:
             "title": str(item.get("title") or ""), "location": str(item.get("location") or ""),
             "country": str(item.get("country") or ""), "work_mode": str(item.get("work_mode") or ""),
             "url": str(item.get("url") or ""), "posted_at": str(item.get("posted_at") or ""),
-            "salary": str(item.get("salary") or ""), "lang_hint": str(item.get("lang_hint") or ""),
+            "salary": pay_text(item.get("salary")), "lang_hint": str(item.get("lang_hint") or ""),
             "employment_type": str(item.get("employment_type") or ""),
             "schedule": str(item.get("schedule") or ""),
             "hours": str(item.get("hours") or ""),
@@ -442,6 +475,12 @@ class Runner:
             # Tier-matched jobs with unresolved location/work mode are still
             # actionable review alerts. Known exclusions never reach this path.
             alertable = value["match"]["status"] in {"match", "review"} and bool(value["match"]["tier_candidates"])
+            # S13: a review job in a known country outside delivery.alert_countries is not worth a message.
+            countries = (self.config.get("delivery") or {}).get("alert_countries")
+            country = str(value["match"].get("country") or "").upper()
+            if alertable and countries and value["match"]["status"] == "review" and country \
+                    and country not in {str(x).upper() for x in countries}:
+                alertable = False
             if value["observation"] == "newly_seen" and alertable:
                 new_items.append(value)
             elif late_days and value["observation"] == "prior_seen" and alertable \
@@ -646,8 +685,9 @@ class Runner:
     def _facts(item: dict) -> list[str]:
         """Pay, hours and German level, only when the listing states them."""
         facts = []
-        if item.get("salary"):
-            facts.append(f"💶 {str(item['salary'])[:120]}")
+        pay = pay_text(item.get("salary"))
+        if pay:
+            facts.append(f"💶 {pay[:120]}")
         if item.get("hours_per_week"):
             facts.append(f"⏱ {item['hours_per_week']} h/week")
         if item.get("german_level"):
@@ -692,16 +732,22 @@ class Runner:
         header = f"📋 {len(items)} new jobs · {local:%a %d %b}"
         footer = f"\n\nInstant Tier 3 alerts today: {instant_count}" if instant_count else ""
         by_tier: dict[str, list[dict]] = {}
+        quick: list[dict] = []
         for item in items:
-            by_tier.setdefault(min(item.get("tiers") or ["?"]), []).append(item)
+            # S13: quick-start jobs of every tier come first, in their own section.
+            if speed and Runner._hire_speed(item, speed) == 0:
+                quick.append(item)
+            else:
+                by_tier.setdefault(min(item.get("tiers") or ["?"]), []).append(item)
+        sections = ([("⚡ QUICK START", quick)] if quick else []) + [(f"TIER {t}", by_tier[t]) for t in sorted(by_tier)]
         chunks: list[str] = []
         members: list[list[str]] = []
         current, current_members = header, []
-        for tier in sorted(by_tier):
+        for label, group in sections:
             # Quickest hire first, then matches before reviews, stated pay first, then by city.
-            jobs = sorted(by_tier[tier], key=lambda x: (Runner._hire_speed(x, speed), x.get("status") != "match",
-                                                        not x.get("salary"), str(x.get("city") or "").casefold()))
-            section = f"\n\nTIER {tier} · {len(jobs)}"
+            jobs = sorted(group, key=lambda x: (Runner._hire_speed(x, speed), x.get("status") != "match",
+                                                not x.get("salary"), str(x.get("city") or "").casefold()))
+            section = f"\n\n{label} · {len(jobs)}"
             current += section
             for job in jobs:
                 place = " · ".join(x for x in (str(job.get("city") or ", ".join(job.get("groups", [])))[:120],
