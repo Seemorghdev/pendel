@@ -39,7 +39,8 @@ SKIP_RX = re.compile(
     r"hilfe|help|kontakt|contact|job[- ]?alert|job[- ]?agent|jobticker|job[- ]?abo|newsletter|"
     r"suchauftrag|suche bearbeiten|edit search|facebook|instagram|linkedin|xing|youtube|tiktok|"
     r"datenschutz\w*|nutzungsbedingungen|e-mail-einstellungen|lebenslauf hochladen|job-match|"
-    r"weitere passende jobs|twitter|blog)\b", re.I)
+    r"weitere passende jobs|twitter|blog|ich bin interessiert|diesen job melden|jobs perfekt auf dich|"
+    r"amtsgericht|sitz der gesellschaft)\b", re.I)
 # Button labels; the real title is elsewhere in the same card.
 BUTTON_RX = re.compile(
     r"^(job ansehen|jetzt ansehen|stelle ansehen|stellenanzeige ansehen|zum job|zur stelle|details|mehr erfahren|"
@@ -333,6 +334,9 @@ def alert_jobs(message: dict, employers: list[dict], received_at: str = "") -> t
             location = place_in(card, company) or title
         job = {"title": title, "company": company, "location": location, "url": url,
                "posted_at": received_at, "description": card or title, "salary": salary_in(card)}
+        if employer.get("country"):
+            # S10c: a national board (BA, StepStone.de) only lists jobs in its country.
+            job["country"] = employer["country"]
         if redirect:
             # Click-tracking links differ per email; identify the job by its content.
             material = "\x1f".join((company, title, location)).casefold()

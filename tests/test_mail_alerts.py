@@ -288,3 +288,15 @@ def test_stepstone_tracking_links_give_the_job_with_employer_and_city():
     assert (job["company"], job["location"]) == ("Magnera GmbH", "Falkenhagen, Prignitz")
     assert job["job_id"].startswith("mail-") and "Vollzeit" in job["description"]
     assert not {"Lebenslauf hochladen", "E-Mail-Einstellungen verwalten"} & set(by_title)
+
+
+def test_national_board_sets_the_country_and_footer_lines_are_not_jobs():
+    board = BA_MARKED | {"country": "DE"}
+    html = ba_card(1, "10000-1-S", "Lagerhelfer (m/w/d)", "TERO GmbH", [], "Hilden")
+    [job], _ = alert_jobs(mail(html=html, sender="BA <jobsuche@arbeitsagentur.de>"), [board])
+    assert job["country"] == "DE"
+    [plain], _ = alert_jobs(mail(html=html, sender="BA <jobsuche@arbeitsagentur.de>"), [BA_MARKED])
+    assert "country" not in plain
+    for line in ("Ich bin interessiert", "Diesen Job melden", "Jobs perfekt auf dich abgestimmt",
+                 "Amtsgericht Düsseldorf, HRB 64185"):
+        assert mail_alerts.SKIP_RX.search(line)
