@@ -28,7 +28,7 @@ SECRET_NAMES = ("PENDEL_GMAIL_CLIENT_ID", "PENDEL_GMAIL_CLIENT_SECRET", "PENDEL_
 DEFAULT_LABEL = "Pendel/Jobs"
 DEFAULT_QUERY = "newer_than:14d"
 SOURCE_ID = "email_alert|gmail"
-BLOCK_TAGS = {"article", "li", "tr", "td", "section"}
+BLOCK_TAGS = {"article", "li", "table", "tr", "td", "section"}  # S10b: email cards are often one table each
 TRACKING_KEYS = {"utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "utm_id",
                  "gh_src", "ref", "src", "trk", "mc_cid", "mc_eid"}
 UNWRAP_KEYS = ("url", "target", "dest", "redirect", "redirect_url", "u")
@@ -37,12 +37,14 @@ SKIP_RX = re.compile(
     r"\b(abmelden|abbestellen|unsubscribe|datenschutz|privacy|impressum|imprint|einstellungen|settings|"
     r"preferences|alle (?:jobs|stellen)|all jobs|view all|login|log in|anmelden|registrieren|profil|"
     r"hilfe|help|kontakt|contact|job[- ]?alert|job[- ]?agent|jobticker|job[- ]?abo|newsletter|"
-    r"suchauftrag|suche bearbeiten|edit search|facebook|instagram|linkedin|xing|youtube|tiktok)\b", re.I)
+    r"suchauftrag|suche bearbeiten|edit search|facebook|instagram|linkedin|xing|youtube|tiktok|"
+    r"datenschutz\w*|nutzungsbedingungen|e-mail-einstellungen|lebenslauf hochladen|job-match|"
+    r"weitere passende jobs|twitter|blog)\b", re.I)
 # Button labels; the real title is elsewhere in the same card.
 BUTTON_RX = re.compile(
     r"^(job ansehen|jetzt ansehen|stelle ansehen|stellenanzeige ansehen|zum job|zur stelle|details|mehr erfahren|"
     r"mehr informationen|jetzt bewerben|bewerben|view job|view details|see job|apply|apply now|"
-    r"learn more|read more|ansehen|öffnen)$", re.I)
+    r"learn more|read more|ansehen|öffnen)[\s➔→»›>]*$", re.I)
 URL_RX = re.compile(r"https?://[^\s<>\"']+")
 MAX_CONTEXT = 600
 _AMOUNT = r"\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{1,2})?"
@@ -71,18 +73,38 @@ def place_in(context: str, employer: str) -> str:
     return _normal(re.sub(r"^[\s·|,:;–-]+|[\s·|,:;–-]+$", "", re.sub(r"(?:\s*[·|]\s*)+", " · ", text)))
 
 
-def board_fields(fragments: list[str], title: str, fields: list[str]) -> dict[str, str]:
+def board_fields(fragments: list[str], title: str, fields: list[str],
+                 markers: dict[str, str] | None = None) -> dict[str, str]:
     """Company and location of a job-board card: its other text lines, in the configured order.
 
-    Lines that are only pay, a date or a button are skipped; "Acme GmbH · 18.11.2026" becomes "Acme GmbH"."""
+    Lines that are only pay, a date or a button are skipped; "Acme GmbH · 18.11.2026" becomes "Acme GmbH".
+    S10b: a line starting with a field's marker ("📍 Hilden") fills that field; only unmarked lines
+    are matched to ``fields`` by order, so optional lines (pay, "ab 01.12.", shifts) can't take its place."""
+    markers = markers or {}
+    found: dict[str, str] = {}
     lines = []
+    pending = None  # a marker that stood alone, so the next line is its value
     for fragment in fragments:
-        if fragment == title or BUTTON_RX.match(fragment):
+        if re.sub(r"^\d{1,3}\.\s+", "", fragment) == title or BUTTON_RX.match(fragment):
+            continue
+        field = pending or next((f for f, mark in markers.items() if fragment.startswith(mark)), None)
+        if field:
+            value = fragment if pending else fragment[len(markers[field]):]
+            value = re.sub(r"\s*\(\d+\s*km\)\s*$", "", value).strip()
+            pending = None if value or pending else field
+            if value:
+                found.setdefault(field, value)
             continue
         cleaned = place_in(fragment, "")
-        if len(cleaned) >= 2 and not SKIP_RX.search(cleaned):
+        # A line needs a letter ("1." is a list number) and isn't the line before it again:
+        # StepStone names the employer above the title and again below it.
+        if len(cleaned) >= 2 and re.search(r"[^\W\d_]", cleaned) and not SKIP_RX.search(cleaned) \
+                and (not lines or cleaned != lines[-1]):
             lines.append(cleaned)
-    return {field: value for field, value in zip(fields, lines) if field}
+    unmarked = [f for f in fields if f and f not in markers]
+    for field, value in zip(unmarked, lines):
+        found.setdefault(field, value)
+    return {k: v for k, v in found.items() if v}
 
 
 class MailClient(Protocol):
@@ -195,6 +217,7 @@ class _MailLinks(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag == "a" and self.active is not None:
+            self.active["parts"] = list(self.active["text"])
             self.active["text"] = _normal(" ".join(self.active["text"]))
             self.anchors.append(self.active)
             self.active = None
@@ -214,12 +237,24 @@ class _MailLinks(HTMLParser):
 def _card_text(anchor: dict) -> list[str]:
     """Text of the smallest enclosing block that holds more than the link itself.
 
-    A block whose text is longer than MAX_CONTEXT is the whole email, not one job card."""
+    A block whose text is longer than MAX_CONTEXT is the whole email, not one job card.
+    S10b: a link's own text can come in pieces ("1." and "Lagerhelfer"); those pieces don't
+    count as card text, and they come back as the one joined link text."""
+    parts = anchor.get("parts") or [anchor["text"]]
     for block in reversed(anchor["blocks"]):
         if len(" ".join(block["text"])) > MAX_CONTEXT:
             break
-        if any(x != anchor["text"] for x in block["text"]):
-            return list(block["text"])
+        if any(x not in parts and x != anchor["text"] for x in block["text"]):
+            out: list[str] = []
+            placed = False
+            for x in block["text"]:
+                if x in parts:
+                    if not placed:
+                        out.append(anchor["text"])
+                        placed = True
+                else:
+                    out.append(x)
+            return out
     return [anchor["text"]] if anchor["text"] else []
 
 
@@ -288,7 +323,10 @@ def alert_jobs(message: dict, employers: list[dict], received_at: str = "") -> t
         card = context if len(context) <= MAX_CONTEXT else ""
         company = employer["name"]
         if employer.get("board"):
-            found = board_fields(fragments if card else [], title, employer.get("card_fields", ["company", "location"]))
+            # BA numbers its cards: "1. Lagerhelfer (m/w/d)".
+            title = re.sub(r"^\d{1,3}\.\s+", "", title)
+            found = board_fields(fragments if card else [], title, employer.get("card_fields", ["company", "location"]),
+                                 employer.get("field_markers"))
             company = found.get("company") or employer["name"]
             location = found.get("location") or place_in(card, company) or title
         else:

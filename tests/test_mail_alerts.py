@@ -237,3 +237,54 @@ def test_employer_entries_keep_their_own_name():
             "<td>Some Other GmbH</td><td>Exampleton</td></tr>")
     [job], _ = alert_jobs(mail(html=html), EMPLOYERS + [BA])
     assert job["company"] == "DHL"
+
+
+BA_MARKED = BA | {"card_fields": ["company"], "field_markers": {"location": "📍"}}
+
+
+def ba_card(n, ref, title, company, extra_lines, city, split_marker=False):
+    rows = "".join(f"<tr><td>{x}</td></tr>" for x in extra_lines)
+    place = f"<td>📍</td><td>{city}</td>" if split_marker else f"<td>📍 {city}</td>"
+    url = f"https://www.arbeitsagentur.de/jobsuche/jobdetail/{ref}"
+    return (f'<table><tr><td><h2><a href="{url}"><span>{n}.</span>\r\n      <span>{title}</span></a></h2></td></tr>'
+            f"<tr><td>{company}</td></tr>{rows}<tr>{place}</tr><tr><td>⏱ Vollzeit</td></tr>"
+            f'<tr><td><a href="{url}">Stelle ansehen➔</a></td></tr></table>')
+
+
+def test_ba_card_city_comes_from_the_pin_line_not_from_optional_lines():
+    html = ("<div>"
+            + ba_card(2, "13280-YX3R0ZV1S0AZTA4K-S", "Lagerhelfer (m/w/d)", "TERO GmbH",
+                      ["15,33 €/Std.", "Schicht/Nacht/Wochenende"], "Hilden")
+            + ba_card(3, "12147-20261119228254-S", "Produktionsmitarbeiter (m/w/d)", "JobImpulse Süd GmbH Trier",
+                      ["15,33 €/Std.", "ab 30.11.2026"], "Trier (3 km)", split_marker=True)
+            + '<p><a href="https://www.arbeitsagentur.de/jobsuche/suche?was=Lagerhelfer">Alle aktuellen Stellen ansehen</a></p>'
+            "</div>")
+    jobs, _ = alert_jobs(mail(html=html, sender="BA <jobsuche@arbeitsagentur.de>"), [BA_MARKED])
+    got = sorted((j["title"], j["company"], j["location"], j["salary"]) for j in jobs)
+    assert got == [("Lagerhelfer (m/w/d)", "TERO GmbH", "Hilden", "15,33 €/Std."),
+                   ("Produktionsmitarbeiter (m/w/d)", "JobImpulse Süd GmbH Trier", "Trier", "15,33 €/Std.")]
+    assert all("Vollzeit" in j["description"] for j in jobs)
+
+
+def test_arrow_button_is_never_a_title():
+    assert mail_alerts.BUTTON_RX.match("Stelle ansehen➔")
+
+
+STEPSTONE = {"name": "StepStone", "board": True, "job_hosts": [], "redirect_hosts": ["click.stepstone.de"],
+             "sender_domains": ["stepstone.de"], "card_fields": ["company", "location"]}
+
+
+def test_stepstone_tracking_links_give_the_job_with_employer_and_city():
+    html = ('<table><tr><td><a href="https://click.stepstone.de/f/a/AAA">Magnera GmbH</a></td></tr>'
+            '<tr><td><a href="https://click.stepstone.de/f/a/BBB"><b>IT On-Site-Support (m/w/d)</b></a></td></tr>'
+            '<tr><td><img alt="company">Magnera GmbH</td></tr><tr><td><img alt="location">Falkenhagen, Prignitz</td></tr>'
+            "<tr><td>Feste Anstellung</td></tr><tr><td>Vollzeit</td></tr>"
+            "<tr><td>31.000 - 45.000 €/Jahr (geschätzt für Vollzeit)</td></tr></table>"
+            '<p><a href="https://click.stepstone.de/f/a/CCC">Lebenslauf hochladen</a></p>'
+            '<p><a href="https://click.stepstone.de/f/a/DDD">E-Mail-Einstellungen verwalten</a></p>')
+    jobs, _ = alert_jobs(mail(html=html, sender="Stepstone <info@jobagent.stepstone.de>"), [STEPSTONE])
+    by_title = {j["title"]: j for j in jobs}
+    job = by_title["IT On-Site-Support (m/w/d)"]
+    assert (job["company"], job["location"]) == ("Magnera GmbH", "Falkenhagen, Prignitz")
+    assert job["job_id"].startswith("mail-") and "Vollzeit" in job["description"]
+    assert not {"Lebenslauf hochladen", "E-Mail-Einstellungen verwalten"} & set(by_title)
