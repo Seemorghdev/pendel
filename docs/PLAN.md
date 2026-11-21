@@ -1,46 +1,30 @@
-# pendel plan (agreed 13 Nov 2026)
+# Pendel implementation notes
 
-**Goal:** every morning, the new English tech roles at companies within commuting reach of Duisburg. Also a public portfolio project.
+## Public package
 
-**Decisions:** alert first, page second · repo public from day one · alerts by Telegram · start with the 87 companies, grow after the coverage review.
+The public repository holds reusable feed readers, generic state handling, matching logic, tests, and a sample static page. Personal employer lists, job-search locations, role preferences, and notification state belong in a separate private runtime.
 
-**Roles:** owner decides, publishes, applies. Overseer writes code and run files. Agent runs and reports in `runs/RESULT-*.md`.
+## Supported intake
 
-**Alongside all of this:** 2 applications a day.
+Use confirmed public feeds from Greenhouse, Lever, Ashby, Recruitee, SmartRecruiters, Personio, Softgarden, and Pinpoint. Keep one source identity per provider and tenant, poll all content-affecting variants, and ignore fetch-only query options when deriving identity. Identify jobs by provider, tenant, and stable provider listing ID first; fall back to the canonical public listing URL.
 
-## Stage 0: Repo setup
-- P0 Skeleton, tests, CI, sample page (`runs/RUN-P1.md`). Done when tests pass locally and the repo is on GitHub.
+The collector reports each source separately. Successful empty results remain distinct from parse errors. Pagination caps are partial results. Failed or partial feeds neither complete a new source's silent baseline nor mark old listings closed. A 429 blocks further requests to that provider host for the run.
 
-## Stage 1: Data foundation (~1–2 days)
-1. Detect each company's recruiting system (`pendel.detect`).
-2. Add lat/lon per company.
-3. Coverage review: how many have a readable public feed?
-- **Decision point:** under ~30 readable → grow the company list before Stage 2.
+## Matching and reports
 
-## Stage 2: Pipeline (~3–4 days)
-1. Readers for the 2–3 most common recruiting systems, then the rest.
-2. Store jobs in DuckDB with `first_seen`; re-runs add no duplicates.
-3. Tag each job: language, category, salary if listed.
-- Done when one command on the Mac fills the database cleanly.
+The private runtime supplies the JSON configuration at run time. A job is classified from its actual listing location, work mode, title, and published description. The language requirement is kept separate from the detected language of the advert. Unknown location, language, work mode, or configured minimum hours is sent to review with a reason; explicit mismatches are excluded with their evidence. Per-tier language and hours limits live only in private configuration.
 
-## Stage 3: Output (~2 days)
-1. **Daily Telegram alert** with today's new matching roles. ← first
-2. Export `web/data/jobs.json`; the page shows real data.
-- Done when the owner uses it every morning.
+Each run produces separate match, review, exclusion, and feed-health reports. City-level grouping is a first pass; verify the route to the exact worksite before treating a listing as reachable without a car.
 
-## Stage 4: Automate and publish (~1 day)
-1. Daily GitHub Actions run (Telegram token as a repo secret); page on GitHub Pages.
-2. README with screenshot; LinkedIn post.
+## Durable state and alerts
 
-## Later
-Real train times instead of km. More regions.
+The private scheduled runner stores compact logical exports on a separate private state branch and restores them into DuckDB on each run. The first successful complete poll of each source is silent. Subsequent first-seen eligible listings enter a durable outbox. A claimed notification is persisted before sending. An interrupted send is marked ambiguous and is not retried automatically.
 
-## Data contract (the only thing the page depends on)
+Telegram delivery requires configured repository secrets and explicit approval. The workflow remains manual-only until its code, test results, dry-run, and recipient are reviewed. Never print secrets or send a test alert to an unconfirmed destination.
 
-```json
-{
-  "generated_at": "2026-11-13T06:00:00Z",
-  "companies": [{"id", "name", "city", "lat", "lon", "remote", "categories": [], "ats", "feed_open"}],
-  "jobs": [{"company_id", "title", "lang", "salary", "first_seen", "url"}]
-}
-```
+## Limits
+
+- Public job-feed data is a snapshot and may be stale or incomplete.
+- An endpoint's successful response is not proof that a posting is still open.
+- Keyword matching is triage, not an application decision.
+- Listings with unclear requirements stay visible for review.
