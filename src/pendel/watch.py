@@ -582,6 +582,59 @@ class Runner:
             ids.update(x.get("identity_key", "") for x in entry.get("payload", {}).get("items", []))
         return ids - {""}
 
+    def _append_instant(self, items: list[dict], local: datetime, now: str, delivery: dict) -> None:
+        """S16: one message per job, unless the batch is larger than
+        ``delivery.instant_bundle_over``; then it goes out as one ranked list.
+        Each Telegram message costs about a minute of run time (two state pushes)."""
+        limit = delivery.get("instant_bundle_over")
+        if limit is not None and len(items) > int(limit):
+            chunks, members = self._daily_digest_chunks(
+                items, local, 0, speed=delivery.get("hire_speed"),
+                title=f"⚡ {len(items)} new Tier 3 jobs · {local:%a %d %b}")
+            self._append_outbox("instant:", items, chunks, members, now)
+        else:
+            chunks = [self._instant_message(item, local) for item in items]
+            self._append_outbox("instant:", items, chunks, [[x["identity_key"]] for x in items], now)
+
+    def rebundle(self) -> int:
+        """S16, run once under the state lock: move the unsent chunks of pending instant
+        messages into one list message. Sent chunks stay sent; the old entries are cancelled."""
+        delivery = self.config.get("delivery") or {}
+        if any(x.get("status") in {"ambiguous", "failed_manual", "sending"} for x in self.state["outbox"]):
+            print("An outbox entry needs manual review first; nothing was rebundled.")
+            return 1
+        now = iso()
+        items: list[dict] = []
+        seen: set[str] = set()
+        old: list[str] = []
+        for entry in self.state["outbox"]:
+            if entry["status"] != "pending" or not entry["outbox_id"].startswith("instant:") \
+                    or entry.get("rebundled"):
+                continue
+            statuses = entry.get("chunk_statuses", [])
+            unsent = {key for i, keys in enumerate(entry.get("chunk_item_ids", []))
+                      if i < len(statuses) and statuses[i] == "pending" for key in keys}
+            for item in entry["payload"].get("items", []):
+                if item.get("identity_key") in unsent and item["identity_key"] not in seen:
+                    seen.add(item["identity_key"])
+                    items.append(item)
+            entry["chunk_statuses"] = ["cancelled" if s == "pending" else s for s in statuses]
+            entry["status"] = "cancelled"
+            entry["updated_at"] = now
+            entry["error"] = "unsent chunks moved into one list message (S16 rebundle)"
+            old.append(entry["outbox_id"])
+        if not items:
+            print("No pending instant messages to rebundle.")
+            return 0
+        local = self.clock().astimezone(ZoneInfo(delivery.get("timezone", "Europe/Berlin")))
+        chunks, members = self._daily_digest_chunks(
+            items, local, 0, speed=delivery.get("hire_speed"),
+            title=f"⚡ {len(items)} Tier 3 jobs you haven't seen yet · {local:%a %d %b}")
+        self._append_outbox("instant:", items, chunks, members, now)
+        self.state["outbox"][-1]["rebundled"] = True
+        print(f"Rebundled {len(items)} jobs from {len(old)} messages into {len(chunks)} chunk(s).")
+        return 0
+
     def _append_outbox(self, prefix: str, items: list[dict], chunks: list[str],
                        chunk_item_ids: list[list[str]], now: str) -> None:
         material = now + json.dumps([x.get("identity_key", "") for x in items])
@@ -615,8 +668,7 @@ class Runner:
         instant = [self._digest_item(x) for x in new_items if instant_tiers & set(x["match"]["tier_candidates"])]
         instant_ids = {x["identity_key"] for x in instant}
         if instant:
-            chunks = [self._instant_message(item, local) for item in instant]
-            self._append_outbox("instant:", instant, chunks, [[x["identity_key"]] for x in instant], now)
+            self._append_instant(instant, local, now, delivery)
         by_day = self.state.setdefault("instant_alerts_by_day", {})
         by_day[today] = by_day.get(today, 0) + len(instant)
 
@@ -739,8 +791,9 @@ class Runner:
 
     @staticmethod
     def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
-                             max_chars: int = 3900, speed: dict | None = None) -> tuple[list[str], list[list[str]]]:
-        header = f"📋 {len(items)} new jobs · {local:%a %d %b}"
+                             max_chars: int = 3900, speed: dict | None = None,
+                             title: str | None = None) -> tuple[list[str], list[list[str]]]:
+        header = title or f"📋 {len(items)} new jobs · {local:%a %d %b}"
         footer = f"\n\nInstant Tier 3 alerts today: {instant_count}" if instant_count else ""
         by_tier: dict[str, list[dict]] = {}
         quick: list[dict] = []
@@ -990,7 +1043,7 @@ class Runner:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--phase", required=True, choices=("prepare", "claim", "deliver", "receipt"))
+    parser.add_argument("--phase", required=True, choices=("prepare", "claim", "deliver", "receipt", "rebundle"))
     parser.add_argument("--sources", required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--state", required=True)
@@ -1016,6 +1069,8 @@ def main() -> int:
             code = runner.prepare(load_sources(args.sources), args.output_dir)
         elif args.phase == "claim":
             code = runner.claim()
+        elif args.phase == "rebundle":
+            code = runner.rebundle()
         elif args.phase == "receipt":
             if not args.report_dir:
                 raise ValueError("--report-dir is required for the receipt phase")

@@ -864,3 +864,45 @@ def test_foreign_review_places_are_skipped_but_german_towns_without_country_are_
     assert not Runner._foreign_place("", "Worms", delivery)
     assert not Runner._foreign_place("DE", "Berlin", delivery)
     assert not Runner._foreign_place("", "Bangalore", {})
+
+
+def _t3(key, title="Lagerhelfer"):
+    return {"identity_key": key, "title": title, "company": "Acme", "city": "Hilden", "status": "match",
+            "tiers": ["3"], "url": f"https://jobs.example/{key}", "groups": ["g"]}
+
+
+def test_large_instant_batch_becomes_one_list_message():
+    runner = Runner(delivery_config(), {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []},
+                    clock=lambda: utc("2026-11-21T09:00:00Z"))
+    local = utc("2026-11-21T10:00:00Z")
+    runner._append_instant([_t3(f"k{i}") for i in range(12)], local, "now", {"instant_bundle_over": 5})
+    [entry] = runner.state["outbox"]
+    assert len(entry["payload"]["chunks"]) == 1 and entry["payload"]["chunks"][0].startswith("⚡ 12 new Tier 3 jobs")
+    runner._append_instant([_t3("a"), _t3("b")], local, "now", {"instant_bundle_over": 5})
+    assert len(runner.state["outbox"][1]["payload"]["chunks"]) == 2
+
+
+def test_rebundle_moves_only_unsent_chunks_into_one_message():
+    items = [_t3(f"k{i}") for i in range(4)]
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [
+        {"outbox_id": "instant:a", "status": "pending", "created_at": "t", "updated_at": "t", "attempts": 2,
+         "error": "", "chunk_statuses": ["sent", "sent", "pending", "pending"],
+         "chunk_item_ids": [[x["identity_key"]] for x in items],
+         "payload": {"items": items, "chunks": ["m0", "m1", "m2", "m3"]}},
+        {"outbox_id": "daily:b", "status": "pending", "created_at": "t", "updated_at": "t", "attempts": 0,
+         "error": "", "chunk_statuses": ["pending"], "chunk_item_ids": [["d"]],
+         "payload": {"items": [_t3("d")], "chunks": ["digest"]}}]}
+    runner = Runner(delivery_config(), state, clock=lambda: utc("2026-11-21T09:00:00Z"))
+    assert runner.rebundle() == 0
+    old, daily, new = state["outbox"]
+    assert (old["status"], old["chunk_statuses"]) == ("cancelled", ["sent", "sent", "cancelled", "cancelled"])
+    assert daily["status"] == "pending"
+    assert [x["identity_key"] for x in new["payload"]["items"]] == ["k2", "k3"]
+    assert new["status"] == "pending" and len(new["payload"]["chunks"]) == 1
+    assert runner.rebundle() == 0 and len(state["outbox"]) == 3
+
+
+def test_rebundle_refuses_while_a_message_needs_review():
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [
+        {"outbox_id": "instant:x", "status": "ambiguous", "chunk_statuses": ["ambiguous"], "payload": {}}]}
+    assert Runner(delivery_config(), state).rebundle() == 1
