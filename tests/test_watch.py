@@ -906,3 +906,22 @@ def test_rebundle_refuses_while_a_message_needs_review():
     state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [
         {"outbox_id": "instant:x", "status": "ambiguous", "chunk_statuses": ["ambiguous"], "payload": {}}]}
     assert Runner(delivery_config(), state).rebundle() == 1
+
+
+def test_uncertain_send_is_retried_when_configured_then_needs_review(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()))
+    cfg = delivery_config()
+    cfg["delivery"]["uncertain_retries"] = 2
+    state = _sending_state()
+    entry = state["outbox"][0]
+    for attempt in (1, 2):
+        Runner(cfg, state).deliver(allow_send=True)
+        assert (entry["status"], entry["chunk_statuses"][0]) == ("pending", "pending")
+        assert f"retry {attempt} of 2" in entry["error"]
+        entry["chunk_statuses"][0], entry["status"] = "sending", "sending"
+    Runner(cfg, state).deliver(allow_send=True)
+    assert entry["status"] == "ambiguous" and entry["chunk_uncertain"] == [3]

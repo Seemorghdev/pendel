@@ -982,9 +982,23 @@ class Runner:
                 item["status"] = "failed_manual"
                 item["error"] = f"Telegram rejected the request (HTTP {exc.code}); not delivered; review before retry"
         except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
-            item["chunk_statuses"][index] = "ambiguous"
-            item["status"] = "ambiguous"
-            item["error"] = f"delivery outcome uncertain ({type(exc).__name__}); manual review required; no automatic retry"
+            # S16b: the owner accepts an occasional duplicate over a blocked feed, so an
+            # uncertain send is retried up to delivery.uncertain_retries times before it
+            # needs manual review. Off (0) unless configured.
+            retries = int((self.config.get("delivery") or {}).get("uncertain_retries", 0))
+            tries = item.setdefault("chunk_uncertain", [0] * len(item["chunk_statuses"]))
+            tries += [0] * (len(item["chunk_statuses"]) - len(tries))
+            item["chunk_uncertain"] = tries
+            tries[index] += 1
+            if tries[index] <= retries:
+                item["chunk_statuses"][index] = "pending"
+                item["status"] = "pending"
+                item["error"] = (f"delivery outcome uncertain ({type(exc).__name__}); "
+                                 f"retry {tries[index]} of {retries}, a duplicate is possible")
+            else:
+                item["chunk_statuses"][index] = "ambiguous"
+                item["status"] = "ambiguous"
+                item["error"] = f"delivery outcome uncertain ({type(exc).__name__}); manual review required; no automatic retry"
         except ValueError:
             item["chunk_statuses"][index] = "failed_manual"
             item["status"] = "failed_manual"
