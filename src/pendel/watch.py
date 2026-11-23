@@ -623,10 +623,14 @@ class Runner:
         # S21: paused tiers (e.g. on-site Germany while the owner is abroad) alert nobody.
         paused = {str(x) for x in delivery.get("paused_tiers", [])}
         tiers = {str(t) for t in tagged.get("tier_candidates", [])} - paused
-        if not remote_only & tiers:
+        # S21b: a remote job-board job ("via") has no local Germany context, so every tier it
+        # matches needs the same "open from here" check as Tier R ("Technical Support
+        # Executive · Pakistan" counted as Tier 1 before).
+        board = bool(value.get("via"))
+        if not board and not remote_only & tiers:
             return tiers
         open_here = tagged.get("work_mode") == "remote" and self._open_here(value, delivery.get("remote_here") or {})
-        return {t for t in tiers if t not in remote_only or open_here}
+        return {t for t in tiers if (t not in remote_only and not board) or open_here}
 
     @staticmethod
     def _open_here(value: dict, rule: dict) -> bool:
@@ -919,6 +923,11 @@ class Runner:
             paused = {str(x) for x in delivery.get("paused_tiers", [])}
             if paused:
                 queue[:] = [x for x in queue if set(map(str, x.get("tiers") or [])) - paused]
+            # S21b: board jobs queued before S21b must be open from here too.
+            rule = delivery.get("remote_here") or {}
+            if rule:
+                queue[:] = [x for x in queue if not x.get("via")
+                            or self._open_here({"title": x.get("title"), "location": x.get("city")}, rule)]
             if queue or by_day.get(today):
                 chunks, members = self._daily_digest_chunks(queue, local, by_day.get(today, 0),
                                                             speed=delivery.get("hire_speed"),

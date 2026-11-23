@@ -1313,3 +1313,31 @@ def test_paused_tiers_alert_nobody_and_leave_the_digest_queue():
     Runner(cfg, state, clock=lambda: utc("2026-11-23T17:30:00Z"))._queue_alerts([], "2026-11-23T17:30:00Z")
     [entry] = state["outbox"]
     assert [x["identity_key"] for x in entry["payload"]["items"]] == ["old1"]
+
+
+def test_board_jobs_need_an_open_location_for_every_tier():
+    from pendel.targets import evaluate_job
+
+    cfg = r_config()
+    cfg["groups"]["remote"]["tiers"] = ["1", "2", "R"]
+    runner = Runner(cfg, {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []})
+
+    def tiers(job):
+        return runner._alert_tiers(job | {"match": evaluate_job(job, runner.config)})
+
+    pakistan = board_job("p", "IT Support Executive", location="Pakistan") | {"via": "Jobicy"}
+    worldwide = board_job("w", "IT Support Executive") | {"via": "Jobicy"}
+    assert tiers(pakistan) == set()
+    assert "1" in tiers(worldwide)
+    assert tiers(listing("x", title="IT Support", mode="onsite")) == {"1"}
+
+
+def test_queued_board_jobs_from_elsewhere_are_dropped_at_digest_time():
+    cfg = r_config()
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [], "digest_queue": [
+        _t3("pk", "Technical Support Executive") | {"tiers": ["1"], "city": "Pakistan", "via": "Jobicy"},
+        _t3("ww", "Support Agent") | {"tiers": ["1"], "city": "Worldwide", "via": "Jobicy"},
+        _t3("de", "IT Support") | {"tiers": ["1"], "city": "Hamburg"}]}
+    Runner(cfg, state, clock=lambda: utc("2026-11-23T17:30:00Z"))._queue_alerts([], "2026-11-23T17:30:00Z")
+    [entry] = state["outbox"]
+    assert sorted(x["identity_key"] for x in entry["payload"]["items"]) == ["de", "ww"]
