@@ -1075,10 +1075,10 @@ def test_tier_r_needs_a_location_open_from_armenia():
         job = board_job("j", title, location=location)
         return "R" in runner._alert_tiers(job | {"match": evaluate_job(job, runner.config)})
     for ok in ["Worldwide", "Anywhere (UTC-3 to UTC+5)", "Remote - Europe", "EMEA", "Europe, Worldwide",
-               "Germany, Armenia, Georgia, Poland, Brazil"]:
+               "Germany, Armenia, Georgia, Poland, Brazil", "Europe, USA"]:
         assert r(ok), ok
     for no in ["", "Remote", "Sweden", "Puerto Rico", "Pakistan", "APAC", "Spain", "Austria, Germany, Switzerland",
-               "Europe, USA"]:
+               ]:
         assert not r(no), no
     assert not r("Worldwide", "Swedish Translation Quality Rater")
 
@@ -1147,3 +1147,83 @@ def test_anywhere_labels_are_overruled_by_a_region_in_the_title_or_text():
     assert not ok("Support Agent", text="We're looking for someone located in the APAC region.")
     assert not ok("Support Agent", "USA Only")
     assert ok("Customer Support for users of our app")
+
+
+def _verify_runner(state=None):
+    cfg = r_config()
+    cfg["delivery"]["remote_here"]["restricted_phrases"] = [r"\bmust (be based|reside) in the (US|United States)\b"]
+    return Runner(cfg, state or {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []},
+                  clock=lambda: utc("2026-11-23T09:00:00Z"))
+
+
+def test_board_jobs_are_checked_against_the_employer_listing(monkeypatch):
+    import urllib.error
+    calls = []
+
+    def fake_fetch(feed, _throttle):
+        calls.append((feed["ats"], feed["token"]))
+        if (feed["ats"], feed["token"]) != ("greenhouse", "globex"):
+            raise urllib.error.HTTPError(feed["feed_url"], 404, "not found", {}, None)
+        return [{"title": "Customer Support Agent", "location": "Remote - US", "description": ""},
+                {"title": "Support Specialist (EMEA)", "location": "Remote - EMEA", "description": ""},
+                {"title": "Chat Support Agent", "location": "Remote", "description": "You must reside in the United States."},
+                {"title": "Community Support Agent", "location": "Remote", "description": ""}]
+    monkeypatch.setattr(fetch, "fetch_jobs", fake_fetch)
+    runner = _verify_runner()
+    values = [board_job(k, t) | {"via": "Remotive", "company": "Globex Inc."} for k, t in
+              [("a", "Customer Support Agent"), ("b", "Support Specialist EMEA"), ("c", "Chat Support Agent"),
+               ("d", "Community Support Agent"), ("e", "Virtual Assistant")]]
+    runner._verify_board_jobs(values)
+    assert [v["verified"] for v in values] == ["no", "yes", "no", "unknown", "unknown"]
+    assert calls == [("greenhouse", "globex")]
+    assert runner.state["employer_ats"]["globex inc."]["slug"] == "globex"
+
+
+def test_employer_lookups_are_cached_including_misses(monkeypatch):
+    import urllib.error
+    calls = []
+
+    def missing(feed, _throttle):
+        calls.append(feed["token"])
+        raise urllib.error.HTTPError(feed["feed_url"], 404, "not found", {}, None)
+    monkeypatch.setattr(fetch, "fetch_jobs", missing)
+    runner = _verify_runner()
+    assert runner._employer_jobs("Angel City VA") == [] and len(calls) == 6
+    assert runner._employer_jobs("Angel City VA") == [] and len(calls) == 6
+
+
+def test_verified_and_unchecked_jobs_are_labelled_and_rejected_ones_not_sent(monkeypatch, tmp_path):
+    from pendel import remote_boards
+    jobs = [board_job("a", "Customer Support Agent"), board_job("b", "Virtual Assistant")]
+    monkeypatch.setattr(remote_boards, "fetch_jobs", lambda _source, _throttle: list(jobs))
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda feed, _t: [
+        {"title": "Customer Support Agent", "location": "Remote - US", "description": ""}]
+        if feed["ats"] == "greenhouse" else [])
+    cfg = r_config()
+    cfg["delivery"]["verify_board_jobs"] = True
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    Runner(cfg, state, clock=lambda: utc("2026-11-23T05:00:00Z")).prepare([board_source()], tmp_path / "r")
+    [entry] = state["outbox"]
+    assert [x["title"] for x in entry["payload"]["items"]] == ["Virtual Assistant"]
+    assert "❓ board label only" in entry["payload"]["chunks"][0]
+    assert state.get("digest_queue", []) == []
+
+
+def test_same_role_allows_small_title_differences():
+    assert Runner._same_role("Support Specialist (EMEA)", "Support Specialist - EMEA")
+    assert not Runner._same_role("Support Specialist", "Senior Support Engineer")
+
+
+def test_the_closest_employer_title_wins_and_any_open_copy_of_it_counts(monkeypatch):
+    listings = [{"title": "Customer Success Engineer", "location": "Remote, US", "description": ""},
+                {"title": "Customer Success Engineer, EMEA", "location": "Remote, Israel", "description": ""}]
+    monkeypatch.setattr(fetch, "fetch_jobs", lambda feed, _t: list(listings) if feed["ats"] == "greenhouse" else [])
+    runner = _verify_runner()
+    [value] = [board_job("g", "Customer Success Engineer, EMEA", location="EMEA Only") | {"via": "We Work Remotely",
+                                                                                         "company": "GitLab"}]
+    runner._verify_board_jobs([value])
+    assert (value["verified"], value["verified_location"]) == ("no", "Remote, Israel")
+    listings.append({"title": "Customer Success Engineer, EMEA", "location": "Remote, EMEA", "description": ""})
+    value.pop("verified")
+    _verify_runner()._verify_board_jobs([value])
+    assert (value["verified"], value["verified_location"]) == ("yes", "Remote, EMEA")

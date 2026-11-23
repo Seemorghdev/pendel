@@ -62,6 +62,13 @@ REPORT_FIELDS = ["status", "groups", "tiers", "company", "title", "location", "w
 # S18: titles or locations that mean working American hours, i.e. nights from Armenia (🌙).
 NIGHT_RX = (r"\b(US|U\.S\.|American?|North American) (business )?(hours|time ?zones?)\b|(?-i:\b(EST|EDT|PST|PDT|CST|CDT)\b)"
             r"|\b(Eastern|Pacific|Central) Time\b|\bAmericas\b|\bnight shift\b|\bovernight\b|\bgraveyard\b")
+# S20: how a board job's location was checked against the employer's own listing.
+VERIFY_LABELS = {"yes": "✅ employer listing", "unknown": "❓ board label only"}
+ROLE_MATCH_MIN = 0.75
+EMPLOYER_ATS = (("greenhouse", "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"),
+                ("lever", "https://api.lever.co/v0/postings/{slug}?mode=json"),
+                ("ashby", "https://api.ashbyhq.com/posting-api/job-board/{slug}"))
+COMPANY_SUFFIX_RX = r"\b(inc|incorporated|llc|ltd|limited|gmbh|ag|bv|b\.v|sa|sas|srl|plc|corp|corporation|co|company|group|hq)\b\.?"
 
 
 def utc_now() -> datetime:
@@ -638,8 +645,100 @@ class Runner:
         pieces = [re.sub(r"\s+only$", "", x).strip() for x in pieces]
         pieces = ["worldwide" if x in {"the world", "world"} else x for x in pieces]
         pieces = [x for x in pieces if x]
+        # S20: a list of places is a choice ("US, Europe"), so one open region is enough.
         # A bare "Remote" names no region, so it doesn't count as open.
-        return bool(pieces) and all(p in regions for p in pieces)
+        return any(p in regions for p in pieces)
+
+    def _verify_board_jobs(self, values: list[dict]) -> None:
+        """S20: for each job-board job, look for the same role on the employer's public
+        Greenhouse, Lever or Ashby board and judge its location from there. Sets
+        ``value["verified"]``: "yes" (open from here), "no" (limited elsewhere) or "unknown"
+        (no employer listing found, or it just says "Remote")."""
+        delivery = self.config.get("delivery") or {}
+        rule = delivery.get("remote_here") or {}
+        budget = int(delivery.get("verify_max_companies", 15))
+        boards: dict[str, list[dict]] = {}
+        for value in values:
+            if not value.get("via"):
+                continue
+            company = str(value.get("company") or "")
+            if company not in boards:
+                if budget <= 0:
+                    value["verified"] = "unknown"
+                    continue
+                budget -= 1
+                boards[company] = self._employer_jobs(company)
+            # The closest title wins; an employer may post one role once per country, so all
+            # equally close listings count, and the role is open if any of them is.
+            scored = [(self._role_score(j.get("title"), value.get("title")), j) for j in boards[company]]
+            best = max((s for s, _ in scored), default=0.0)
+            matches = [j for s, j in scored if best >= ROLE_MATCH_MIN and s == best]
+            if not matches:
+                value["verified"] = "unknown"
+                continue
+            verdicts = []
+            for match in matches:
+                location = str(match.get("location") or "")
+                listing = {"title": value.get("title"), "location": location,
+                           "description": str(match.get("description") or "")}
+                if self._open_here(listing, rule):
+                    verdicts.append(("yes", location))
+                elif re.sub(r"[\W_]+|remote", "", location, flags=re.I) == "" and not any(
+                        re.search(str(p), listing["description"], re.I) for p in rule.get("restricted_phrases", [])):
+                    verdicts.append(("unknown", location))
+                else:
+                    verdicts.append(("no", location))
+            verdict = next((v for v in ("yes", "unknown", "no") if any(x == v for x, _ in verdicts)))
+            value["verified"] = verdict
+            value["verified_location"] = "; ".join(dict.fromkeys(loc for x, loc in verdicts if x == verdict))[:300]
+
+    def _employer_jobs(self, company: str) -> list[dict]:
+        """S20: the jobs on the employer's public ATS board, found by trying its name as a
+        board slug. Where it was found (or that nothing was) is cached in state for 7 days."""
+        cache = self.state.setdefault("employer_ats", {})
+        key = norm(company).strip()
+        base = re.sub(COMPANY_SUFFIX_RX, " ", key)
+        words = re.findall(r"[a-z0-9]+", base)
+        if not words:
+            return []
+        slugs = list(dict.fromkeys(["".join(words), "-".join(words)]))
+        known = cache.get(key) or {}
+        fresh = known.get("checked_at") and _posted_since(known["checked_at"], iso(self.clock() - timedelta(days=7)))
+        tries = [(known["ats"], known["slug"])] if fresh and known.get("ats") else \
+            [] if fresh else [(ats, slug) for ats, _ in EMPLOYER_ATS for slug in slugs]
+        urls = dict(EMPLOYER_ATS)
+        for ats, slug in tries:
+            feed = {"ats": ats, "token": slug, "feed_url": urls[ats].format(slug=slug)}
+            try:
+                jobs = fetch.fetch_jobs(feed, self.throttle)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (404, 410):
+                    continue
+                return []
+            except (fetch.RateLimited, fetch.IncompleteFeed, urllib.error.URLError, TimeoutError, OSError,
+                    http.client.HTTPException, ValueError, KeyError, TypeError, AttributeError):
+                return []
+            if jobs:
+                cache[key] = {"ats": ats, "slug": slug, "checked_at": iso(self.clock())}
+                return jobs
+        if not fresh:
+            cache[key] = {"ats": "", "slug": "", "checked_at": iso(self.clock())}
+        return []
+
+    @staticmethod
+    def _role_score(a, b) -> float:
+        """S20: how alike two job titles are (shared words / all words), 0 to 1."""
+        def words(x):
+            return set(re.findall(r"[a-z0-9]+", norm(str(x or ""))))
+        left, right = words(a), words(b)
+        if not left or not right:
+            return 0.0
+        return len(left & right) / len(left | right)
+
+    @staticmethod
+    def _same_role(a, b) -> bool:
+        """S20: the same job title, allowing small differences ("Support Agent (EMEA)")."""
+        return Runner._role_score(a, b) >= ROLE_MATCH_MIN
 
     @staticmethod
     def _digest_item(value: dict) -> dict:
@@ -656,7 +755,8 @@ class Runner:
                 "salary": str(value.get("salary") or ""),
                 "hours_per_week": tagged.get("hours_per_week"),
                 "german_level": tagged.get("german_level", ""),
-                "via": str(value.get("via") or ""), "night": night}
+                "via": str(value.get("via") or ""), "night": night,
+                "verified": str(value.get("verified") or "")}
 
     @staticmethod
     def _foreign_place(country, location, delivery: dict) -> bool:
@@ -762,8 +862,12 @@ class Runner:
         local = self.clock().astimezone(ZoneInfo(delivery.get("timezone", "Europe/Berlin")))
         today = local.date().isoformat()
         instant_tiers = {str(tier) for tier in delivery.get("instant_tiers", [])}
-        instant = [self._digest_item(x) for x in new_items if instant_tiers & self._alert_tiers(x)]
-        instant_ids = {x["identity_key"] for x in instant}
+        candidates = [x for x in new_items if instant_tiers & self._alert_tiers(x)]
+        # S20: check board jobs against the employer's own listing; drop the ones it limits elsewhere.
+        if delivery.get("verify_board_jobs"):
+            self._verify_board_jobs(candidates)
+        instant = [self._digest_item(x) for x in candidates if x.get("verified") != "no"]
+        instant_ids = {x["identity_key"] for x in candidates}
         # S18b: boards repost one role under several ids; send it once per batch (and not in the digest).
         seen_roles: set[tuple[str, str]] = set()
         instant = [x for x in instant if not ((role := (norm(x["title"]), norm(x["company"]))) in seen_roles
@@ -869,6 +973,8 @@ class Runner:
         facts = Runner._facts(item)
         if item.get("night"):
             facts.append("🌙 US hours")
+        if VERIFY_LABELS.get(str(item.get("verified") or "")):
+            facts.append(VERIFY_LABELS[str(item["verified"])])
         if facts:
             lines.append("  ".join(facts))
         # A match may still carry informational reasons; only a review needs a look.
@@ -927,6 +1033,7 @@ class Runner:
                     mark = "❔" if job.get("status") == "review" else mark
                     pay = pay_text(job.get("salary"))[:60]
                     extra = ("🌙 US hours" if job.get("night") else "",
+                             VERIFY_LABELS.get(str(job.get("verified") or ""), ""),
                              f"via {job['via']}" if job.get("via") else "")
                     entry = "\n" + " · ".join(x for x in (f"{mark} {str(job.get('title', ''))[:120]}",
                                                           place, pay, *extra) if x)
