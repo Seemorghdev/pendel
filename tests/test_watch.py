@@ -1129,3 +1129,21 @@ def test_night_jobs_and_board_credit_show_in_compact_lists():
              "match": {"status": "match", "group_tier_matches": [], "tier_candidates": ["R"], "reasons": []}}
     assert Runner._digest_item(value)["night"] is True
     assert Runner._digest_item(value | {"title": "Support (Estonia team)"})["night"] is False
+
+
+def test_anywhere_labels_are_overruled_by_a_region_in_the_title_or_text():
+    rule = {"places": ["Armenia"], "regions": ["Worldwide", "EMEA", "Europe"],
+            "title_regions": ["APAC", "US", "USA", "LATAM", "Canada", "UK"],
+            "restricted_phrases": [r"\b(must|need to) (be )?(based|located|reside|live) in (the )?(US|USA|United States)\b",
+                                   r"\blocated in the APAC region\b"]}
+
+    def ok(title, location="Anywhere in the World", text=""):
+        return Runner._open_here({"title": title, "location": location, "description": text}, rule)
+    assert ok("Customer Support Specialist")
+    assert ok("Customer Success Engineer, EMEA", "EMEA Only")
+    assert not ok("Implementation Engineer, Customer Support (APAC)")
+    assert not ok("Support Agent - US")
+    assert not ok("Support Agent", text="You must be based in the US.")
+    assert not ok("Support Agent", text="We're looking for someone located in the APAC region.")
+    assert not ok("Support Agent", "USA Only")
+    assert ok("Customer Support for users of our app")

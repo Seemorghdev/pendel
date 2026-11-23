@@ -11,6 +11,7 @@ most 4 requests a day).
 | jobicy    | https://jobicy.com/api/jobs           | last 7 days, cursor pages of up to 100  |
 | remoteok  | https://remoteok.com/api              | first array element is the legal notice |
 | himalayas | https://himalayas.app/jobs/api        | newest first, cursor pages of 20        |
+| weworkremotely | https://weworkremotely.com/…/*.rss | S19: public RSS; asks for links back    |
 """
 
 from __future__ import annotations
@@ -19,10 +20,13 @@ import html
 import json
 import re
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree
 
 from pendel import fetch
 
-NAMES = {"remotive": "Remotive", "jobicy": "Jobicy", "remoteok": "Remote OK", "himalayas": "Himalayas"}
+NAMES = {"remotive": "Remotive", "jobicy": "Jobicy", "remoteok": "Remote OK", "himalayas": "Himalayas",
+         "weworkremotely": "We Work Remotely"}
 JOBICY_MAX_PAGES = 10
 HIMALAYAS_MAX_PAGES = 25
 DESCRIPTION_CHARS = 20_000
@@ -104,6 +108,26 @@ def parse_himalayas(data: dict) -> list[dict]:
     return out
 
 
+def parse_weworkremotely(xml_text: str) -> list[dict]:
+    """S19: We Work Remotely's public RSS. Titles read "Company: Role"; the region is
+    its own element ("Anywhere in the World", "EMEA Only", "USA Only")."""
+    root = ElementTree.fromstring(xml_text)
+    out = []
+    for item in root.iter("item"):
+        fields = {child.tag.rsplit("}", 1)[-1].casefold(): (child.text or "").strip() for child in item}
+        company, _, role = fields.get("title", "").partition(":")
+        if not role:
+            company, role = "", company
+        place = ", ".join(x for x in (fields.get("region", ""), fields.get("country", "")) if x)
+        try:
+            posted = parsedate_to_datetime(fields.get("pubdate", "")).astimezone(timezone.utc).isoformat()
+        except (TypeError, ValueError):
+            posted = ""
+        link = fields.get("link") or fields.get("guid", "")
+        out.append(_job(link, role, company, place, link, posted.replace("+00:00", "Z"), "", fields.get("description")))
+    return out
+
+
 def fetch_jobs(source: dict, throttle) -> list[dict]:
     """Return the parsed jobs of one board feed URL. Pages are capped; the newest jobs
     come first, so a capped board is still treated as complete."""
@@ -112,6 +136,8 @@ def fetch_jobs(source: dict, throttle) -> list[dict]:
         return parse_remotive(json.loads(fetch.get(url, throttle)))
     if ats == "remoteok":
         return parse_remoteok(json.loads(fetch.get(url, throttle)))
+    if ats == "weworkremotely":
+        return parse_weworkremotely(fetch.get(url, throttle))
     if ats in {"jobicy", "himalayas"}:
         parse = parse_jobicy if ats == "jobicy" else parse_himalayas
         pages = JOBICY_MAX_PAGES if ats == "jobicy" else HIMALAYAS_MAX_PAGES

@@ -46,3 +46,17 @@ def test_cursor_boards_follow_next_cursor_until_it_ends(monkeypatch):
     monkeypatch.setattr(fetch, "get", get)
     jobs = remote_boards.fetch_jobs({"ats": "jobicy", "feed_url": "https://jobicy.com/api/jobs?count=100"}, None)
     assert [j["title"] for j in jobs] == ["A", "B"] and len(seen) == 2
+
+
+def test_weworkremotely_rss_splits_company_and_role_and_keeps_region():
+    xml = """<?xml version="1.0"?><rss version="2.0"><channel><title>WWR</title>
+    <item><title>Bitwarden: Implementation Engineer, Customer Support (APAC)</title>
+      <region>Anywhere in the World</region><category>Customer Support</category><type>Full-Time</type>
+      <description>&lt;p&gt;Help users&lt;/p&gt;</description><pubDate>Mon, 23 Nov 2026 06:01:51 +0000</pubDate>
+      <guid>https://weworkremotely.com/remote-jobs/bitwarden-x</guid>
+      <link>https://weworkremotely.com/remote-jobs/bitwarden-x</link></item>
+    </channel></rss>"""
+    [job] = remote_boards.parse_weworkremotely(xml)
+    assert (job["company"], job["title"]) == ("Bitwarden", "Implementation Engineer, Customer Support (APAC)")
+    assert job["location"] == "Anywhere in the World" and job["posted_at"] == "2026-11-23T06:01:51Z"
+    assert job["url"] == "https://weworkremotely.com/remote-jobs/bitwarden-x" and job["description"] == "Help users"

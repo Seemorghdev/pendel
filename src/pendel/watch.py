@@ -619,6 +619,14 @@ class Runner:
         others = [str(x) for x in rule.get("other_languages", [])]
         if others and re.search(r"\b(" + "|".join(map(re.escape, others)) + r")\b", title, re.I):
             return False
+        # S19: boards label many jobs "Anywhere in the World" whose title or text limits them
+        # to a region ("Support Engineer (APAC)", "must be located in the US").
+        title_regions = [str(x) for x in rule.get("title_regions", [])]
+        if title_regions and re.search(r"(?<![\w.])(" + "|".join(map(re.escape, title_regions)) + r")(?![\w])", title):
+            return False
+        text = str(value.get("description") or "")
+        if any(re.search(str(p), text, re.I) for p in rule.get("restricted_phrases", [])):
+            return False
         location = re.sub(r"\([^)]*\)", " ", str(value.get("location") or ""))
         places = [str(x) for x in rule.get("places", [])]
         if places and re.search(r"\b(" + "|".join(map(re.escape, places)) + r")\b", location, re.I):
@@ -626,6 +634,9 @@ class Runner:
         regions = {norm(str(x)).strip() for x in rule.get("regions", [])}
         pieces = [norm(re.sub(r"^((fully\s+)?remote|anywhere in)\s*[-–:]?\s*", "", p.strip(), flags=re.I)).strip()
                   for p in re.split(r"[,;/|]|\bor\b|\band\b", location) if p.strip()]
+        # "EMEA Only" (We Work Remotely) is the region EMEA; "Anywhere in the World" is Worldwide.
+        pieces = [re.sub(r"\s+only$", "", x).strip() for x in pieces]
+        pieces = ["worldwide" if x in {"the world", "world"} else x for x in pieces]
         pieces = [x for x in pieces if x]
         # A bare "Remote" names no region, so it doesn't count as open.
         return bool(pieces) and all(p in regions for p in pieces)
