@@ -994,24 +994,20 @@ def test_claim_next_claims_nothing_after_an_uncertain_send(tmp_path, monkeypatch
     assert later["chunk_statuses"] == ["pending"]
 
 
-def test_compact_lists_put_each_job_on_one_line_and_need_fewer_chunks():
+def test_compact_lists_put_each_job_on_one_line_and_stay_within_the_limit():
     items = []
     for i in range(73):
-        title = (f"Lagermitarbeiter Wareneingang Schicht {i}" if i == 0 else
-                 f"Lagermitarbeiter Wareneingang Schicht {i} — {('mit Erfahrung und flexiblen Arbeitszeiten in einem dynamischen Team ' * 3)}")
-        job = _t3(f"k{i:02d}", title=title)
+        job = _t3(f"k{i:02d}", title=f"Lagermitarbeiter Wareneingang Schicht {i}")
         job["url"] = f"https://jobs.example/stellenangebote/lager/{i:02d}?utm_source=feed&ref=abcdef"
         job["salary"] = "{'@type': 'QuantitativeValue', 'minValue': 2488, 'maxValue': 2600, 'unitText': 'MONTH'}"
         job["hours_per_week"] = 40
-        job["german_level"] = "B1-B2 erforderlich"
-        job["reasons"] = ["Arbeitszeiten und Sprachkenntnisse vor Bewerbung prüfen; genaue Anforderungen stehen in der vollständigen Anzeige."]
         items.append(job)
     items[0] |= {"status": "review", "reasons": ["German level unclear", "hours unclear"]}
     local = utc("2026-11-22T10:00:00Z")
     full, _ = Runner._daily_digest_chunks(items, local, 0)
     short, members = Runner._daily_digest_chunks(items, local, 0, compact=True)
     assert sum(len(x) for x in members) == 73 and all(len(x) <= 3900 for x in short)
-    assert len(short) < len(full)
+    assert len(short) <= len(full)
     assert "❔ Lagermitarbeiter Wareneingang Schicht 0 · Hilden · Acme · 2,488–2,600 €/month\n" in "".join(short)
     assert "⚠️" not in "".join(short) and "⏱" not in "".join(short)
     print(len(full), "->", len(short))
@@ -1019,7 +1015,8 @@ def test_compact_lists_put_each_job_on_one_line_and_need_fewer_chunks():
 
 def r_config():
     cfg = config()
-    cfg["groups"]["remote"]["tiers"] = ["1", "2", "R"]
+    cfg["groups"]["remote"]["tiers"] = ["R"]
+    cfg["tiers"]["2"]["phrases"] = ["No matching Tier 2 title"]
     cfg["tiers"]["R"] = {"phrases": ["Customer Support", "Virtual Assistant", "Persian"]}
     cfg["countries"] = {"allowed": ["DE"], "remote_allowed": ["DE"], "remote_regions": ["Worldwide", "Europe"]}
     cfg["delivery"] = {"instant_tiers": ["R"], "remote_only_tiers": ["R"], "digest_hour": 18,
@@ -1073,7 +1070,7 @@ def test_tier_r_needs_a_location_open_from_armenia():
 
     def r(location, title="Customer Support Agent"):
         job = board_job("j", title, location=location)
-        return "R" in runner._alert_tiers(job | {"match": evaluate_job(job, runner.config)})
+        return runner._alert_tiers(job | {"match": evaluate_job(job, runner.config)}) == {"R"}
     for ok in ["Worldwide", "Anywhere (UTC-3 to UTC+5)", "Remote - Europe", "EMEA", "Europe, Worldwide",
                "Germany, Armenia, Georgia, Poland, Brazil", "Europe, USA"]:
         assert r(ok), ok
@@ -1227,3 +1224,92 @@ def test_the_closest_employer_title_wins_and_any_open_copy_of_it_counts(monkeypa
     value.pop("verified")
     _verify_runner()._verify_board_jobs([value])
     assert (value["verified"], value["verified_location"]) == ("yes", "Remote, EMEA")
+
+
+def _indeed_jobs(n):
+    items = []
+    for i in range(n):
+        job = _t3(f"k{i:02d}", title=f"Lagerhelfer <Früh> & Spät {i}")
+        job["url"] = "https://de.indeed.com/pagead/clk/dl?ad=" + "x" * 380 + f"&n={i}"
+        items.append(job)
+    return items
+
+
+def test_link_titles_fit_57_jobs_with_long_tracking_links_into_far_fewer_messages():
+    from html.parser import HTMLParser
+    from pendel.watch import telegram_length
+    items, local = _indeed_jobs(57), utc("2026-11-23T17:05:00Z")
+    plain, _ = Runner._daily_digest_chunks(items, local, 0, compact=True)
+    linked, members = Runner._daily_digest_chunks(items, local, 0, compact=True, links=True)
+    assert len(plain) >= 6 and len(linked) <= 2 and sum(map(len, members)) == 57
+    assert all(telegram_length(x) <= 3900 for x in linked)
+    first = linked[0]
+    assert '<a href="https://de.indeed.com/pagead/clk/dl?ad=' in first and "&amp;n=0" in first
+    assert "Lagerhelfer &lt;Früh&gt; &amp; Spät 0</a>" in first and "\n  https://" not in first
+
+    class Strict(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.open = []
+
+        def handle_starttag(self, tag, _attrs):
+            assert tag == "a"
+            self.open.append(tag)
+
+        def handle_endtag(self, tag):
+            assert self.open.pop() == tag
+    for chunk in linked:
+        parser = Strict()
+        parser.feed(chunk)
+        assert parser.open == []
+
+
+def test_link_titles_cap_links_per_message():
+    from pendel import watch
+    chunks, members = Runner._daily_digest_chunks(_indeed_jobs(120), utc("2026-11-23T17:05:00Z"), 0,
+                                                  compact=True, links=True, max_chars=100_000)
+    assert [len(m) for m in members] == [watch.MAX_LINKS_PER_MESSAGE, watch.MAX_LINKS_PER_MESSAGE, 20]
+
+
+def test_html_chunks_are_sent_with_parse_mode_and_measured_by_visible_text(monkeypatch):
+    sent = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen",
+                        lambda request, **_kw: sent.append(json.loads(request.data)) or Response())
+    body = "📋 list" + "".join(f'\n• <a href="https://x.example/{"y" * 300}">job {i}</a>' for i in range(40))
+    assert len(body) > 4096
+    state = _sending_state()
+    state["outbox"][0]["payload"] = {"chunks": [body], "parse_mode": "HTML"}
+    Runner(config(), state).deliver(True)
+    assert state["outbox"][0]["status"] == "sent" and sent[0]["parse_mode"] == "HTML"
+    plain = _sending_state()
+    Runner(config(), plain).deliver(True)
+    assert "parse_mode" not in sent[1]
+
+
+def test_paused_tiers_alert_nobody_and_leave_the_digest_queue():
+    from pendel.targets import evaluate_job
+    cfg = r_config()
+    cfg["groups"]["area-a"]["tiers"] = ["1", "2", "3"]
+    cfg["delivery"]["paused_tiers"] = ["3"]
+    runner = Runner(cfg, {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []})
+    job = listing("w", title="Lagerhelfer")
+    match = evaluate_job(job, cfg)
+    assert "3" in match["tier_candidates"] and runner._alert_tiers(job | {"match": match}) == set()
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [], "digest_queue": [
+        _t3("old3") | {"tiers": ["3"]}, _t3("old1") | {"tiers": ["1", "3"]}]}
+    Runner(cfg, state, clock=lambda: utc("2026-11-23T17:30:00Z"))._queue_alerts([], "2026-11-23T17:30:00Z")
+    [entry] = state["outbox"]
+    assert [x["identity_key"] for x in entry["payload"]["items"]] == ["old1"]

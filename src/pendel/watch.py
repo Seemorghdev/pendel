@@ -13,6 +13,7 @@ import argparse
 import ast
 import csv
 import hashlib
+import html
 import http.client
 import json
 import os
@@ -65,6 +66,8 @@ NIGHT_RX = (r"\b(US|U\.S\.|American?|North American) (business )?(hours|time ?zo
 # S20: how a board job's location was checked against the employer's own listing.
 VERIFY_LABELS = {"yes": "✅ employer listing", "unknown": "❓ board label only"}
 ROLE_MATCH_MIN = 0.75
+# S21: Telegram doesn't document a limit on links per message; stay well below any.
+MAX_LINKS_PER_MESSAGE = 50
 EMPLOYER_ATS = (("greenhouse", "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"),
                 ("lever", "https://api.lever.co/v0/postings/{slug}?mode=json"),
                 ("ashby", "https://api.ashbyhq.com/posting-api/job-board/{slug}"))
@@ -166,6 +169,13 @@ def pay_text(value) -> str:
         return ""
     symbol = "€" if currency == "EUR" else currency
     return f"{span} {symbol}" + (f"/{unit}" if unit else "")
+
+
+def telegram_length(text: str) -> int:
+    """S21: the length Telegram counts for an HTML message: the visible text after its
+    tags and entities are parsed, in UTF-16 units (an emoji outside the BMP counts as 2)."""
+    visible = html.unescape(re.sub(r"<[^>]+>", "", str(text)))
+    return len(visible.encode("utf-16-le")) // 2
 
 
 def _posted_since(posted, since: str) -> bool:
@@ -610,7 +620,9 @@ class Runner:
         tagged = value["match"]
         delivery = self.config.get("delivery") or {}
         remote_only = {str(x) for x in delivery.get("remote_only_tiers", [])}
-        tiers = {str(t) for t in tagged.get("tier_candidates", [])}
+        # S21: paused tiers (e.g. on-site Germany while the owner is abroad) alert nobody.
+        paused = {str(x) for x in delivery.get("paused_tiers", [])}
+        tiers = {str(t) for t in tagged.get("tier_candidates", [])} - paused
         if not remote_only & tiers:
             return tiers
         open_here = tagged.get("work_mode") == "remote" and self._open_here(value, delivery.get("remote_here") or {})
@@ -784,11 +796,12 @@ class Runner:
         Each Telegram message costs about a minute of run time (two state pushes)."""
         limit = delivery.get("instant_bundle_over")
         label = delivery.get("instant_title", "new Tier 3 jobs")
+        links = bool(delivery.get("link_titles"))
         if limit is not None and len(items) > int(limit):
             chunks, members = self._daily_digest_chunks(
                 items, local, 0, speed=delivery.get("hire_speed"), compact=bool(delivery.get("compact_lists")),
-                title=f"⚡ {len(items)} {label} · {local:%a %d %b}")
-            self._append_outbox("instant:", items, chunks, members, now)
+                title=f"⚡ {len(items)} {label} · {local:%a %d %b}", links=links)
+            self._append_outbox("instant:", items, chunks, members, now, parse_mode="HTML" if links else "")
         else:
             chunks = [self._instant_message(item, local) for item in items]
             self._append_outbox("instant:", items, chunks, [[x["identity_key"]] for x in items], now)
@@ -826,21 +839,26 @@ class Runner:
         local = self.clock().astimezone(ZoneInfo(delivery.get("timezone", "Europe/Berlin")))
         chunks, members = self._daily_digest_chunks(
             items, local, 0, speed=delivery.get("hire_speed"), compact=bool(delivery.get("compact_lists")),
-            title=f"⚡ {len(items)} Tier 3 jobs you haven't seen yet · {local:%a %d %b}")
-        self._append_outbox("instant:", items, chunks, members, now)
+            title=f"⚡ {len(items)} Tier 3 jobs you haven't seen yet · {local:%a %d %b}",
+            links=bool(delivery.get("link_titles")))
+        self._append_outbox("instant:", items, chunks, members, now,
+                            parse_mode="HTML" if delivery.get("link_titles") else "")
         self.state["outbox"][-1]["rebundled"] = True
         print(f"Rebundled {len(items)} jobs from {len(old)} messages into {len(chunks)} chunk(s).")
         return 0
 
     def _append_outbox(self, prefix: str, items: list[dict], chunks: list[str],
-                       chunk_item_ids: list[list[str]], now: str) -> None:
+                       chunk_item_ids: list[list[str]], now: str, parse_mode: str = "") -> None:
         material = now + json.dumps([x.get("identity_key", "") for x in items])
+        payload = {"items": items, "chunks": chunks}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         self.state["outbox"].append({"outbox_id": prefix + hashlib.sha256(material.encode()).hexdigest()[:20],
                                       "status": "pending", "created_at": now, "updated_at": now,
                                       "attempts": 0, "error": "",
                                       "chunk_statuses": ["pending"] * len(chunks),
                                       "chunk_item_ids": chunk_item_ids,
-                                      "payload": {"items": items, "chunks": chunks}})
+                                      "payload": payload})
 
     def _queue_alerts(self, new_items: list[dict], now: str, statuses: list[dict] | None = None) -> None:
         """Route new listings to the outbox.
@@ -897,11 +915,17 @@ class Runner:
 
         due = local.hour >= int(delivery.get("digest_hour", 18))
         if due and self.state.get("last_digest_date") != today:
+            # S21: jobs queued before a tier was paused don't go out either.
+            paused = {str(x) for x in delivery.get("paused_tiers", [])}
+            if paused:
+                queue[:] = [x for x in queue if set(map(str, x.get("tiers") or [])) - paused]
             if queue or by_day.get(today):
                 chunks, members = self._daily_digest_chunks(queue, local, by_day.get(today, 0),
                                                             speed=delivery.get("hire_speed"),
-                                                            compact=bool(delivery.get("compact_lists")))
-                self._append_outbox("daily:", list(queue), chunks, members, now)
+                                                            compact=bool(delivery.get("compact_lists")),
+                                                            links=bool(delivery.get("link_titles")))
+                self._append_outbox("daily:", list(queue), chunks, members, now,
+                                    parse_mode="HTML" if delivery.get("link_titles") else "")
             self.state.setdefault("digest_items_by_day", {})[today] = len(queue)
             self.state["digest_queue"] = []
             self.state["last_digest_date"] = today
@@ -1002,8 +1026,15 @@ class Runner:
     @staticmethod
     def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
                              max_chars: int = 3900, speed: dict | None = None,
-                             title: str | None = None, compact: bool = False) -> tuple[list[str], list[list[str]]]:
-        header = title or f"📋 {len(items)} new jobs · {local:%a %d %b}"
+                             title: str | None = None, compact: bool = False,
+                             links: bool = False) -> tuple[list[str], list[list[str]]]:
+        # S21: with ``links`` (and ``compact``) the chunks are Telegram HTML: each title is the
+        # link, so the long tracking URLs don't count toward the message limit, which applies
+        # to the visible text only. Every text piece is escaped; size checks use the visible length.
+        links = links and compact
+        esc = (lambda s: html.escape(str(s), quote=False)) if links else str
+        size = telegram_length if links else len
+        header = esc(title or f"📋 {len(items)} new jobs · {local:%a %d %b}")
         footer = f"\n\nInstant Tier 3 alerts today: {instant_count}" if instant_count else ""
         by_tier: dict[str, list[dict]] = {}
         quick: list[dict] = []
@@ -1035,8 +1066,14 @@ class Runner:
                     extra = ("🌙 US hours" if job.get("night") else "",
                              VERIFY_LABELS.get(str(job.get("verified") or ""), ""),
                              f"via {job['via']}" if job.get("via") else "")
-                    entry = "\n" + " · ".join(x for x in (f"{mark} {str(job.get('title', ''))[:120]}",
-                                                          place, pay, *extra) if x)
+                    name = str(job.get("title", ""))[:120]
+                    if links and job.get("url"):
+                        href = html.escape(str(job["url"])[:2000], quote=True)
+                        name = f'<a href="{href}">{esc(name)}</a>'
+                    else:
+                        name = esc(name)
+                    entry = "\n" + " · ".join(x for x in (f"{mark} {name}", esc(place), esc(pay),
+                                                          *map(esc, extra)) if x)
                 else:
                     entry = f"\n{mark} {str(job.get('title', ''))[:250]}"
                     detail = " · ".join([place] + Runner._facts(job)) if place else " · ".join(Runner._facts(job))
@@ -1048,9 +1085,10 @@ class Runner:
                         entry += f"\n  {detail}"
                     if job.get("status") == "review" and job.get("reasons"):
                         entry += "\n  ⚠️ " + "; ".join(job["reasons"][:2])[:200]
-                if job.get("url"):
+                if job.get("url") and not links:
                     entry += "\n  " + str(job["url"])[:1000]
-                if len(current) + len(entry) + len(footer) > max_chars and current_members:
+                if current_members and (size(current) + size(entry) + size(footer) > max_chars
+                                        or (links and len(current_members) >= MAX_LINKS_PER_MESSAGE)):
                     chunks.append(current)
                     members.append(current_members)
                     current, current_members = header + " (continued)" + section, []
@@ -1171,7 +1209,8 @@ class Runner:
             return 0
         index = item["chunk_index"]
         body = item["payload"]["chunks"][index]
-        if len(body) > 4096:
+        parse_mode = str(item["payload"].get("parse_mode") or "")
+        if (telegram_length(body) if parse_mode == "HTML" else len(body)) > 4096:
             item["status"] = "failed_manual"
             item["chunk_statuses"][index] = "failed_manual"
             item["error"] = "message exceeds Telegram's limit; review required"
@@ -1179,8 +1218,10 @@ class Runner:
             print("Claimed Telegram chunk exceeds the message limit; no request made.")
             return 1
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        request = urllib.request.Request(url, data=json.dumps({"chat_id": chat_id, "text": body,
-                               "disable_web_page_preview": True}).encode(),
+        message = {"chat_id": chat_id, "text": body, "disable_web_page_preview": True}
+        if parse_mode:
+            message["parse_mode"] = parse_mode
+        request = urllib.request.Request(url, data=json.dumps(message).encode(),
                                headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
