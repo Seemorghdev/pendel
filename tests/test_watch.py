@@ -1015,3 +1015,117 @@ def test_compact_lists_put_each_job_on_one_line_and_need_fewer_chunks():
     assert "❔ Lagermitarbeiter Wareneingang Schicht 0 · Hilden · Acme · 2,488–2,600 €/month\n" in "".join(short)
     assert "⚠️" not in "".join(short) and "⏱" not in "".join(short)
     print(len(full), "->", len(short))
+
+
+def r_config():
+    cfg = config()
+    cfg["groups"]["remote"]["tiers"] = ["1", "2", "R"]
+    cfg["tiers"]["R"] = {"phrases": ["Customer Support", "Virtual Assistant", "Persian"]}
+    cfg["countries"] = {"allowed": ["DE"], "remote_allowed": ["DE"], "remote_regions": ["Worldwide", "Europe"]}
+    cfg["delivery"] = {"instant_tiers": ["R"], "remote_only_tiers": ["R"], "digest_hour": 18,
+                       "timezone": "Europe/Berlin", "alert_on_first_run": ["remotive"], "first_run_days": 14,
+                       "instant_first": True, "instant_title": "new remote jobs",
+                       "remote_here": {"places": ["Armenia"], "regions": ["Worldwide", "Anywhere", "Europe", "EMEA"],
+                                       "other_languages": ["Swedish", "Spanish"]}}
+    return cfg
+
+
+def board_source():
+    return {"source_id": "remotive|https://remotive.com/api/remote-jobs", "ats": "remotive", "token": "",
+            "feed_url": "https://remotive.com/api/remote-jobs", "career_url": "", "companies": "Remotive",
+            "source_groups": "", "source_tiers": "R", "source_collections": "remote-boards"}
+
+
+def board_job(job_id, title, posted="2026-11-20T10:00:00", location="Worldwide"):
+    return {"job_id": job_id, "title": title, "company": "Globex", "location": location, "country": "",
+            "work_mode": "remote", "url": f"https://remotive.com/remote-jobs/{job_id}", "posted_at": posted,
+            "salary": "", "lang_hint": "", "description": "English is required for this role.", "schedule": ""}
+
+
+def test_first_board_run_alerts_recent_remote_jobs_instantly_with_company_and_credit(monkeypatch, tmp_path):
+    from pendel import remote_boards
+    jobs = [board_job("new", "Customer Support Agent"), board_job("old", "Customer Support Agent II", "2026-10-01T10:00:00")]
+    monkeypatch.setattr(remote_boards, "fetch_jobs", lambda _source, _throttle: list(jobs))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    Runner(r_config(), state, clock=lambda: utc("2026-11-23T05:00:00Z")).prepare([board_source()], tmp_path / "r")
+    [entry] = state["outbox"]
+    assert entry["outbox_id"].startswith("instant:")
+    assert [x["title"] for x in entry["payload"]["items"]] == ["Customer Support Agent"]
+    body = entry["payload"]["chunks"][0]
+    assert "Globex" in body and "(via Remotive)" in body
+    assert state["sources"][board_source()["source_id"]]["last_attempt"] == "2026-11-23T05:00:00Z"
+
+
+def test_tier_r_phrase_on_an_onsite_job_is_not_a_remote_alert():
+    from pendel.targets import evaluate_job
+    runner = Runner(r_config(), {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []})
+
+    def tiers(job):
+        return runner._alert_tiers(job | {"match": evaluate_job(job, runner.config)})
+    assert tiers(listing("x", title="Virtual Assistant", mode="onsite")) == set()
+    assert tiers(board_job("y", "Virtual Assistant")) == {"R"}
+    assert tiers(listing("z", title="IT Support Persian speaker", mode="onsite")) == {"1"}
+
+
+def test_tier_r_needs_a_location_open_from_armenia():
+    from pendel.targets import evaluate_job
+    runner = Runner(r_config(), {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []})
+
+    def r(location, title="Customer Support Agent"):
+        job = board_job("j", title, location=location)
+        return "R" in runner._alert_tiers(job | {"match": evaluate_job(job, runner.config)})
+    for ok in ["Worldwide", "Anywhere (UTC-3 to UTC+5)", "Remote - Europe", "EMEA", "Europe, Worldwide",
+               "Germany, Armenia, Georgia, Poland, Brazil"]:
+        assert r(ok), ok
+    for no in ["", "Remote", "Sweden", "Puerto Rico", "Pakistan", "APAC", "Spain", "Austria, Germany, Switzerland",
+               "Europe, USA"]:
+        assert not r(no), no
+    assert not r("Worldwide", "Swedish Translation Quality Rater")
+
+
+def test_the_same_role_reposted_under_several_ids_is_sent_once(monkeypatch, tmp_path):
+    from pendel import remote_boards
+    jobs = [board_job(i, "Virtual Assistant") for i in ("a", "b", "c")] + [board_job("d", "Customer Support Agent")]
+    monkeypatch.setattr(remote_boards, "fetch_jobs", lambda _source, _throttle: list(jobs))
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []}
+    Runner(r_config(), state, clock=lambda: utc("2026-11-23T05:00:00Z")).prepare([board_source()], tmp_path / "r")
+    titles = sorted(x["title"] for e in state["outbox"] for x in e["payload"]["items"])
+    assert titles == ["Customer Support Agent", "Virtual Assistant"]
+    assert state.get("digest_queue", []) == []
+
+
+def test_instant_first_claims_instant_messages_before_older_digests(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "set-but-never-used")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "private-id")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+
+    def entry(oid):
+        return {"outbox_id": oid, "status": "pending", "created_at": "t", "updated_at": "t", "attempts": 0,
+                "error": "", "chunk_statuses": ["pending"], "payload": {"items": [], "chunks": [oid]}}
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [entry("daily:a"), entry("instant:b")]}
+    Runner(r_config(), state).claim()
+    assert [x["status"] for x in state["outbox"]] == ["pending", "sending"]
+    plain = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [entry("daily:a"), entry("instant:b")]}
+    Runner(config(), plain).claim()
+    assert [x["status"] for x in plain["outbox"]] == ["sending", "pending"]
+
+
+def test_board_sources_are_skipped_until_their_interval_has_passed():
+    cfg = r_config() | {"fetch_intervals_minutes": {"remotive": 360}}
+    sid = board_source()["source_id"]
+    state = {"schema_version": 1, "jobs": {}, "sources": {sid: {"last_attempt": "2026-11-23T02:00:00Z"}}, "outbox": []}
+    now = [utc("2026-11-23T05:00:00Z")]
+    runner = Runner(cfg, state, clock=lambda: now[0])
+    assert runner._due_sources([board_source(), source()]) == [source()]
+    now[0] = utc("2026-11-23T08:00:00Z")
+    assert runner._due_sources([board_source(), source()]) == [board_source(), source()]
+
+
+def test_night_jobs_and_board_credit_show_in_compact_lists():
+    items = [_t3("a", title="Support Agent (US hours)") | {"night": True, "via": "Himalayas"}, _t3("b")]
+    chunks, _ = Runner._daily_digest_chunks(items, utc("2026-11-23T05:00:00Z"), 0, compact=True)
+    assert "Support Agent (US hours) · Hilden · Acme · 🌙 US hours · via Himalayas" in chunks[0]
+    value = {"identity_key": "k", "title": "Chat Support, EST", "company": "Acme", "url": "u", "location": "Worldwide",
+             "match": {"status": "match", "group_tier_matches": [], "tier_candidates": ["R"], "reasons": []}}
+    assert Runner._digest_item(value)["night"] is True
+    assert Runner._digest_item(value | {"title": "Support (Estonia team)"})["night"] is False

@@ -33,9 +33,9 @@ from zoneinfo import ZoneInfo
 
 import duckdb
 
-from pendel import fetch, mail_alerts
+from pendel import fetch, mail_alerts, remote_boards
 from pendel.audit import write_delivery_receipt, write_rollups
-from pendel.targets import evaluate_job, load_config
+from pendel.targets import evaluate_job, load_config, norm
 
 STATE_VERSION = 1
 STATE_SCHEMA = """
@@ -59,6 +59,9 @@ REPORT_FIELDS = ["status", "groups", "tiers", "company", "title", "location", "w
                  "language_requirement_status", "german_level", "advert_language", "hours_status",
                  "hours_per_week", "hours_per_week_max", "commute_status", "commute_note", "posted_at", "first_seen", "url", "reasons", "source_ids",
                  "identity_key", "observation"]
+# S18: titles or locations that mean working American hours, i.e. nights from Armenia (🌙).
+NIGHT_RX = (r"\b(US|U\.S\.|American?|North American) (business )?(hours|time ?zones?)\b|(?-i:\b(EST|EDT|PST|PDT|CST|CDT)\b)"
+            r"|\b(Eastern|Pacific|Central) Time\b|\bAmericas\b|\bnight shift\b|\bovernight\b|\bgraveyard\b")
 
 
 def utc_now() -> datetime:
@@ -156,6 +159,17 @@ def pay_text(value) -> str:
         return ""
     symbol = "€" if currency == "EUR" else currency
     return f"{span} {symbol}" + (f"/{unit}" if unit else "")
+
+
+def _posted_since(posted, since: str) -> bool:
+    """S18: True if an ISO ``posted`` time is at or after ``since``. An unknown date counts as recent."""
+    try:
+        when = datetime.fromisoformat(str(posted or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when >= datetime.fromisoformat(since.replace("Z", "+00:00"))
 
 
 def identity_key(source: dict[str, str], item: dict) -> str:
@@ -273,9 +287,10 @@ class Runner:
             return "skipped_after_rate_limit", "provider host rate-limited earlier in this run", [], False, False
         status, error, complete, limited = "ok", "", True, False
         jobs: list[dict] = []
+        reader = remote_boards.fetch_jobs if source["ats"] in remote_boards.NAMES else fetch.fetch_jobs
         for variant_url in source.get("feed_urls") or [source["feed_url"]]:
             try:
-                jobs.extend(fetch.fetch_jobs(source | {"feed_url": variant_url}, self.throttle))
+                jobs.extend(reader(source | {"feed_url": variant_url}, self.throttle))
             except fetch.RateLimited as exc:
                 status, error, complete, limited = "rate_limited", str(exc), False, True
                 break
@@ -335,10 +350,31 @@ class Runner:
                              "job_count": len(jobs), "complete": complete})
             if not complete:
                 continue
+            board = source["ats"] in remote_boards.NAMES
             for item in jobs:
-                self._add_job(current, source, item)
+                # S18: a job board lists many employers; the company comes from each job.
+                self._add_job(current, source, item, company=(item.get("company") or None) if board else None)
         self._collect_email(current, statuses)
         return current, statuses
+
+    def _due_sources(self, sources: list[dict[str, str]]) -> list[dict[str, str]]:
+        """S18: leave out sources fetched less than ``fetch_intervals_minutes[ats]`` ago.
+        A skipped source is simply not part of this run: no status, no failure, no baseline change."""
+        intervals = self.config.get("fetch_intervals_minutes") or {}
+        now = self.clock()
+        due = []
+        for source in sources:
+            minutes = intervals.get(source["ats"])
+            last = (self.state["sources"].get(source["source_id"]) or {}).get("last_attempt")
+            if minutes and last:
+                try:
+                    since = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                except ValueError:
+                    since = None
+                if since and now - since < timedelta(minutes=int(minutes)):
+                    continue
+            due.append(source)
+        return due
 
     def _add_job(self, current: dict[str, dict], source: dict[str, str], item: dict,
                  company: str | None = None) -> None:
@@ -355,6 +391,7 @@ class Runner:
             "hours": str(item.get("hours") or ""),
             "hours_per_week": str(item.get("hours_per_week") or ""),
             "description": str(item.get("description") or ""), "source_ids": [source["source_id"]],
+            "via": remote_boards.NAMES.get(source["ats"], ""),
         }
         tagged = evaluate_job(value, self.config)
         value["match"] = tagged
@@ -394,6 +431,7 @@ class Runner:
 
     def prepare(self, sources: list[dict[str, str]], output_dir: str | Path) -> int:
         now = iso(self.clock())
+        sources = self._due_sources(sources)
         current, statuses = self.collect(sources)
         new_items: list[dict] = []
         baseline_count = 0
@@ -441,6 +479,7 @@ class Runner:
             baseline_before.setdefault(status["source_id"], bool(src_state.get("baseline_complete")))
             src_state["last_status"] = status["status"]
             src_state["last_error"] = status["error"]
+            src_state["last_attempt"] = now
             by_status[status["status"]] += 1
             if status["complete"]:
                 src_state["last_success"] = now
@@ -451,6 +490,12 @@ class Runner:
         late_days = (self.config.get("delivery") or {}).get("late_match_days")
         late_since = iso(self.clock() - timedelta(days=int(late_days))) if late_days else ""
         already_sent = self._alerted_ids() if late_days else set()
+        # S18: a new board source normally starts with a silent baseline. For these ats the
+        # jobs it lists on its first run are alerted too, if posted in the last first_run_days.
+        delivery = self.config.get("delivery") or {}
+        first_run_ats = {str(x) for x in delivery.get("alert_on_first_run", [])}
+        first_run_since = iso(self.clock() - timedelta(days=int(delivery.get("first_run_days", 14))))
+        ats_by_source = {s["source_id"]: s["ats"] for s in statuses}
         catch_up: list[dict] = []
         for ident, value in current.items():
             seen = self.state["jobs"].get(ident)
@@ -458,7 +503,9 @@ class Runner:
                 seen = {"first_seen": now, "last_seen": now, "source_ids": value["source_ids"]}
                 self.state["jobs"][ident] = seen
                 has_prior_baseline = any(baseline_before.get(sid, False) for sid in value["source_ids"])
-                if has_prior_baseline:
+                first_run = any(ats_by_source.get(sid) in first_run_ats for sid in value["source_ids"]) \
+                    and _posted_since(value.get("posted_at"), first_run_since)
+                if has_prior_baseline or first_run:
                     value["observation"] = "newly_seen"
                 else:
                     value["observation"] = "baseline"
@@ -475,7 +522,7 @@ class Runner:
                 value["tiers"] = "; ".join(sorted({x["tier"] for x in value["match"]["group_tier_matches"]}))
             # Tier-matched jobs with unresolved location/work mode are still
             # actionable review alerts. Known exclusions never reach this path.
-            alertable = value["match"]["status"] in {"match", "review"} and bool(value["match"]["tier_candidates"])
+            alertable = value["match"]["status"] in {"match", "review"} and bool(self._alert_tiers(value))
             if alertable and value["match"]["status"] == "review" and self._foreign_place(
                     value["match"].get("country") or value.get("country"), value.get("location"),
                     self.config.get("delivery") or {}):
@@ -549,10 +596,46 @@ class Runner:
         # sources out of both baseline and first-seen accounting.
         return 0
 
+    def _alert_tiers(self, value: dict) -> set[str]:
+        """S18: the tiers a job is alerted for. A tier in ``delivery.remote_only_tiers`` counts
+        only for a remote job whose listed location is open from where the owner is now
+        (S18b: ``delivery.remote_here``), and whose title doesn't ask for another language."""
+        tagged = value["match"]
+        delivery = self.config.get("delivery") or {}
+        remote_only = {str(x) for x in delivery.get("remote_only_tiers", [])}
+        tiers = {str(t) for t in tagged.get("tier_candidates", [])}
+        if not remote_only & tiers:
+            return tiers
+        open_here = tagged.get("work_mode") == "remote" and self._open_here(value, delivery.get("remote_here") or {})
+        return {t for t in tiers if t not in remote_only or open_here}
+
+    @staticmethod
+    def _open_here(value: dict, rule: dict) -> bool:
+        """S18b: True when the location names one of ``rule.places`` (e.g. Armenia, also inside
+        a long country list) or is only open regions (Worldwide, EMEA, Europe). A location
+        that lists only other countries, or is empty, is not open here. A title naming one of
+        ``rule.other_languages`` ("Swedish Translation Rater") is not either."""
+        title = str(value.get("title") or "")
+        others = [str(x) for x in rule.get("other_languages", [])]
+        if others and re.search(r"\b(" + "|".join(map(re.escape, others)) + r")\b", title, re.I):
+            return False
+        location = re.sub(r"\([^)]*\)", " ", str(value.get("location") or ""))
+        places = [str(x) for x in rule.get("places", [])]
+        if places and re.search(r"\b(" + "|".join(map(re.escape, places)) + r")\b", location, re.I):
+            return True
+        regions = {norm(str(x)).strip() for x in rule.get("regions", [])}
+        pieces = [norm(re.sub(r"^((fully\s+)?remote|anywhere in)\s*[-–:]?\s*", "", p.strip(), flags=re.I)).strip()
+                  for p in re.split(r"[,;/|]|\bor\b|\band\b", location) if p.strip()]
+        pieces = [x for x in pieces if x]
+        # A bare "Remote" names no region, so it doesn't count as open.
+        return bool(pieces) and all(p in regions for p in pieces)
+
     @staticmethod
     def _digest_item(value: dict) -> dict:
         tagged = value["match"]
         cities = [x["city"] for x in tagged["group_tier_matches"] if x.get("city")]
+        night = value.get("schedule") == "night" or bool(re.search(
+            NIGHT_RX, f"{value.get('title', '')} {value.get('location', '')}", re.I))
         return {"identity_key": value["identity_key"], "title": value["title"], "company": value["company"],
                 "url": value["url"], "status": tagged["status"],
                 "groups": sorted({x["group_id"] for x in tagged["group_tier_matches"]}),
@@ -561,7 +644,8 @@ class Runner:
                 "city": cities[0] if cities else str(value.get("location") or ""),
                 "salary": str(value.get("salary") or ""),
                 "hours_per_week": tagged.get("hours_per_week"),
-                "german_level": tagged.get("german_level", "")}
+                "german_level": tagged.get("german_level", ""),
+                "via": str(value.get("via") or ""), "night": night}
 
     @staticmethod
     def _foreign_place(country, location, delivery: dict) -> bool:
@@ -588,10 +672,11 @@ class Runner:
         ``delivery.instant_bundle_over``; then it goes out as one ranked list.
         Each Telegram message costs about a minute of run time (two state pushes)."""
         limit = delivery.get("instant_bundle_over")
+        label = delivery.get("instant_title", "new Tier 3 jobs")
         if limit is not None and len(items) > int(limit):
             chunks, members = self._daily_digest_chunks(
                 items, local, 0, speed=delivery.get("hire_speed"), compact=bool(delivery.get("compact_lists")),
-                title=f"⚡ {len(items)} new Tier 3 jobs · {local:%a %d %b}")
+                title=f"⚡ {len(items)} {label} · {local:%a %d %b}")
             self._append_outbox("instant:", items, chunks, members, now)
         else:
             chunks = [self._instant_message(item, local) for item in items]
@@ -666,8 +751,12 @@ class Runner:
         local = self.clock().astimezone(ZoneInfo(delivery.get("timezone", "Europe/Berlin")))
         today = local.date().isoformat()
         instant_tiers = {str(tier) for tier in delivery.get("instant_tiers", [])}
-        instant = [self._digest_item(x) for x in new_items if instant_tiers & set(x["match"]["tier_candidates"])]
+        instant = [self._digest_item(x) for x in new_items if instant_tiers & self._alert_tiers(x)]
         instant_ids = {x["identity_key"] for x in instant}
+        # S18b: boards repost one role under several ids; send it once per batch (and not in the digest).
+        seen_roles: set[tuple[str, str]] = set()
+        instant = [x for x in instant if not ((role := (norm(x["title"]), norm(x["company"]))) in seen_roles
+                                              or seen_roles.add(role))]
         if instant:
             self._append_instant(instant, local, now, delivery)
         by_day = self.state.setdefault("instant_alerts_by_day", {})
@@ -767,13 +856,15 @@ class Runner:
         if place:
             lines.append(f"📍 {place}")
         facts = Runner._facts(item)
+        if item.get("night"):
+            facts.append("🌙 US hours")
         if facts:
             lines.append("  ".join(facts))
         # A match may still carry informational reasons; only a review needs a look.
         if item.get("status") == "review" and item.get("reasons"):
             lines.append("⚠️ " + "; ".join(item["reasons"][:2])[:250])
         if item.get("url"):
-            lines.append(str(item["url"])[:1000])
+            lines.append(str(item["url"])[:1000] + (f"  (via {item['via']})" if item.get("via") else ""))
         return "\n".join(lines)
 
     @staticmethod
@@ -824,11 +915,17 @@ class Runner:
                     # Reviews are marked ❔ instead of listing their reasons.
                     mark = "❔" if job.get("status") == "review" else mark
                     pay = pay_text(job.get("salary"))[:60]
+                    extra = ("🌙 US hours" if job.get("night") else "",
+                             f"via {job['via']}" if job.get("via") else "")
                     entry = "\n" + " · ".join(x for x in (f"{mark} {str(job.get('title', ''))[:120]}",
-                                                          place, pay) if x)
+                                                          place, pay, *extra) if x)
                 else:
                     entry = f"\n{mark} {str(job.get('title', ''))[:250]}"
                     detail = " · ".join([place] + Runner._facts(job)) if place else " · ".join(Runner._facts(job))
+                    if job.get("night"):
+                        detail = " · ".join(x for x in (detail, "🌙 US hours") if x)
+                    if job.get("via"):
+                        detail = " · ".join(x for x in (detail, f"via {job['via']}") if x)
                     if detail:
                         entry += f"\n  {detail}"
                     if job.get("status") == "review" and job.get("reasons"):
@@ -916,7 +1013,11 @@ class Runner:
             print("An earlier Telegram delivery needs manual review; no later digest was claimed.")
             return 0
         claimed = None
-        for item in self.state["outbox"]:
+        # S18: with delivery.instant_first, instant messages go before older digests and notices.
+        order = self.state["outbox"]
+        if (self.config.get("delivery") or {}).get("instant_first"):
+            order = sorted(order, key=lambda x: not str(x.get("outbox_id", "")).startswith("instant:"))
+        for item in order:
             if item["status"] != "pending":
                 continue
             statuses = item.setdefault("chunk_statuses", ["pending"] * len(item.get("payload", {}).get("chunks", [])))
