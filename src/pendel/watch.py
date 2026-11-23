@@ -2,6 +2,7 @@
 
 Typical private-runner phases:
   prepare -> persist state branch -> claim -> persist state branch -> deliver -> persist.
+  With --claim-next, deliver also claims the next chunk, so each message needs one persist.
 
 The state JSON is a compact logical export stored outside this public package.
 Each invocation restores it into a fresh DuckDB file before processing.
@@ -589,7 +590,7 @@ class Runner:
         limit = delivery.get("instant_bundle_over")
         if limit is not None and len(items) > int(limit):
             chunks, members = self._daily_digest_chunks(
-                items, local, 0, speed=delivery.get("hire_speed"),
+                items, local, 0, speed=delivery.get("hire_speed"), compact=bool(delivery.get("compact_lists")),
                 title=f"⚡ {len(items)} new Tier 3 jobs · {local:%a %d %b}")
             self._append_outbox("instant:", items, chunks, members, now)
         else:
@@ -628,7 +629,7 @@ class Runner:
             return 0
         local = self.clock().astimezone(ZoneInfo(delivery.get("timezone", "Europe/Berlin")))
         chunks, members = self._daily_digest_chunks(
-            items, local, 0, speed=delivery.get("hire_speed"),
+            items, local, 0, speed=delivery.get("hire_speed"), compact=bool(delivery.get("compact_lists")),
             title=f"⚡ {len(items)} Tier 3 jobs you haven't seen yet · {local:%a %d %b}")
         self._append_outbox("instant:", items, chunks, members, now)
         self.state["outbox"][-1]["rebundled"] = True
@@ -694,7 +695,8 @@ class Runner:
         if due and self.state.get("last_digest_date") != today:
             if queue or by_day.get(today):
                 chunks, members = self._daily_digest_chunks(queue, local, by_day.get(today, 0),
-                                                            speed=delivery.get("hire_speed"))
+                                                            speed=delivery.get("hire_speed"),
+                                                            compact=bool(delivery.get("compact_lists")))
                 self._append_outbox("daily:", list(queue), chunks, members, now)
             self.state.setdefault("digest_items_by_day", {})[today] = len(queue)
             self.state["digest_queue"] = []
@@ -792,7 +794,7 @@ class Runner:
     @staticmethod
     def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
                              max_chars: int = 3900, speed: dict | None = None,
-                             title: str | None = None) -> tuple[list[str], list[list[str]]]:
+                             title: str | None = None, compact: bool = False) -> tuple[list[str], list[list[str]]]:
         header = title or f"📋 {len(items)} new jobs · {local:%a %d %b}"
         footer = f"\n\nInstant Tier 3 alerts today: {instant_count}" if instant_count else ""
         by_tier: dict[str, list[dict]] = {}
@@ -817,12 +819,20 @@ class Runner:
                 place = " · ".join(x for x in (str(job.get("city") or ", ".join(job.get("groups", [])))[:120],
                                                str(job.get("company", ""))[:120]) if x)
                 mark = "⚡" if speed and Runner._hire_speed(job, speed) == 0 else "•"
-                entry = f"\n{mark} {str(job.get('title', ''))[:250]}"
-                detail = " · ".join([place] + Runner._facts(job)) if place else " · ".join(Runner._facts(job))
-                if detail:
-                    entry += f"\n  {detail}"
-                if job.get("status") == "review" and job.get("reasons"):
-                    entry += "\n  ⚠️ " + "; ".join(job["reasons"][:2])[:200]
+                if compact:
+                    # S17: one line per job (title · city · company · pay), then the link.
+                    # Reviews are marked ❔ instead of listing their reasons.
+                    mark = "❔" if job.get("status") == "review" else mark
+                    pay = pay_text(job.get("salary"))[:60]
+                    entry = "\n" + " · ".join(x for x in (f"{mark} {str(job.get('title', ''))[:120]}",
+                                                          place, pay) if x)
+                else:
+                    entry = f"\n{mark} {str(job.get('title', ''))[:250]}"
+                    detail = " · ".join([place] + Runner._facts(job)) if place else " · ".join(Runner._facts(job))
+                    if detail:
+                        entry += f"\n  {detail}"
+                    if job.get("status") == "review" and job.get("reasons"):
+                        entry += "\n  ⚠️ " + "; ".join(job["reasons"][:2])[:200]
                 if job.get("url"):
                     entry += "\n  " + str(job["url"])[:1000]
                 if len(current) + len(entry) + len(footer) > max_chars and current_members:
@@ -1070,6 +1080,8 @@ def main() -> int:
     parser.add_argument("--fetch-workers", type=int, default=1,
                         help="fetch this many provider hosts side by side; each host keeps --delay spacing")
     parser.add_argument("--allow-send", action="store_true", help="requires PENDEL_TELEGRAM_APPROVED=true as well")
+    parser.add_argument("--claim-next", action="store_true",
+                        help="deliver phase: after recording the outcome, claim the next pending chunk")
     parser.add_argument("--bootstrap", action="store_true", help="create empty state only for the intentional initial baseline")
     args = parser.parse_args()
     try:
@@ -1093,6 +1105,11 @@ def main() -> int:
             code = 0
         else:
             code = runner.deliver(args.allow_send)
+            # S17: record this chunk's outcome and claim the next one in the same state
+            # write, so the runner persists once per message. claim() claims nothing
+            # while an entry needs review.
+            if code == 0 and args.claim_next:
+                code = runner.claim()
         if args.phase != "receipt":
             write_state(args.state, state, args.db)
         return code

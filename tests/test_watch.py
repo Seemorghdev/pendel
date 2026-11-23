@@ -925,3 +925,93 @@ def test_uncertain_send_is_retried_when_configured_then_needs_review(monkeypatch
         entry["chunk_statuses"][0], entry["status"] = "sending", "sending"
     Runner(cfg, state).deliver(allow_send=True)
     assert entry["status"] == "ambiguous" and entry["chunk_uncertain"] == [3]
+
+
+def _main_with_state(tmp_path, monkeypatch, state, *extra):
+    import json
+    import sys
+    from pendel import watch
+    from pendel.watch import write_state
+    state_file, cfg_file = tmp_path / "state.json", tmp_path / "targets.json"
+    write_state(state_file, state, tmp_path / "seed.duckdb")
+    cfg_file.write_text(json.dumps(config()), encoding="utf-8")
+    (tmp_path / "sources.csv").write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["watch", "--phase", "deliver", "--allow-send", *extra,
+                                      "--sources", str(tmp_path / "sources.csv"), "--config", str(cfg_file),
+                                      "--state", str(state_file), "--db", str(tmp_path / "run.duckdb")])
+    code = watch.main()
+    return code, load_state(state_file)
+
+
+def _ok_telegram(monkeypatch):
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def read(self):
+            return b'{"ok": true}'
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen", lambda *_args, **_kwargs: Response())
+
+
+def _two_chunk_state():
+    return {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [
+        {"outbox_id": "d1", "status": "sending", "chunk_index": 0, "chunk_statuses": ["sending", "pending"],
+         "payload": {"chunks": ["first", "second"]}, "attempts": 1,
+         "created_at": "2026-11-15T12:00:00Z", "updated_at": "2026-11-15T12:00:00Z", "error": ""}]}
+
+
+def test_deliver_with_claim_next_records_and_claims_in_one_state_write(tmp_path, monkeypatch):
+    _ok_telegram(monkeypatch)
+    code, saved = _main_with_state(tmp_path, monkeypatch, _two_chunk_state(), "--claim-next")
+    entry = saved["outbox"][0]
+    assert code == 0 and entry["chunk_statuses"] == ["sent", "sending"] and entry["chunk_index"] == 1
+    assert entry["status"] == "sending"
+
+
+def test_deliver_without_claim_next_leaves_the_next_chunk_pending(tmp_path, monkeypatch):
+    _ok_telegram(monkeypatch)
+    code, saved = _main_with_state(tmp_path, monkeypatch, _two_chunk_state())
+    assert code == 0 and saved["outbox"][0]["chunk_statuses"] == ["sent", "pending"]
+
+
+def test_claim_next_claims_nothing_after_an_uncertain_send(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError()))
+    state = _two_chunk_state()
+    state["outbox"].append({"outbox_id": "later", "status": "pending", "chunk_statuses": ["pending"],
+                            "payload": {"chunks": ["do not send"]}, "attempts": 0,
+                            "created_at": "2026-11-15T12:00:00Z", "updated_at": "2026-11-15T12:00:00Z", "error": ""})
+    _, saved = _main_with_state(tmp_path, monkeypatch, state, "--claim-next")
+    first, later = saved["outbox"]
+    assert first["status"] == "ambiguous" and first["chunk_statuses"] == ["ambiguous", "pending"]
+    assert later["chunk_statuses"] == ["pending"]
+
+
+def test_compact_lists_put_each_job_on_one_line_and_need_fewer_chunks():
+    items = []
+    for i in range(73):
+        title = (f"Lagermitarbeiter Wareneingang Schicht {i}" if i == 0 else
+                 f"Lagermitarbeiter Wareneingang Schicht {i} — {('mit Erfahrung und flexiblen Arbeitszeiten in einem dynamischen Team ' * 3)}")
+        job = _t3(f"k{i:02d}", title=title)
+        job["url"] = f"https://jobs.example/stellenangebote/lager/{i:02d}?utm_source=feed&ref=abcdef"
+        job["salary"] = "{'@type': 'QuantitativeValue', 'minValue': 2488, 'maxValue': 2600, 'unitText': 'MONTH'}"
+        job["hours_per_week"] = 40
+        job["german_level"] = "B1-B2 erforderlich"
+        job["reasons"] = ["Arbeitszeiten und Sprachkenntnisse vor Bewerbung prüfen; genaue Anforderungen stehen in der vollständigen Anzeige."]
+        items.append(job)
+    items[0] |= {"status": "review", "reasons": ["German level unclear", "hours unclear"]}
+    local = utc("2026-11-22T10:00:00Z")
+    full, _ = Runner._daily_digest_chunks(items, local, 0)
+    short, members = Runner._daily_digest_chunks(items, local, 0, compact=True)
+    assert sum(len(x) for x in members) == 73 and all(len(x) <= 3900 for x in short)
+    assert len(short) < len(full)
+    assert "❔ Lagermitarbeiter Wareneingang Schicht 0 · Hilden · Acme · 2,488–2,600 €/month\n" in "".join(short)
+    assert "⚠️" not in "".join(short) and "⏱" not in "".join(short)
+    print(len(full), "->", len(short))
