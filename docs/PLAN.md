@@ -12,15 +12,15 @@ The collector reports each source separately. Successful empty results remain di
 
 ## Matching and reports
 
-The private runtime supplies the JSON configuration at run time. A job is classified from its actual listing location, work mode, title, and published description. The language requirement is kept separate from the detected language of the advert. Unknown location, language, work mode, or configured minimum hours is sent to review with a reason; explicit mismatches are excluded with their evidence. Per-tier language and hours limits live only in private configuration.
+The private runtime supplies the JSON configuration at run time. A job is classified from its actual listing location, work mode, title, and published description. The language requirement is kept separate from the detected language of the advert. A title without a configured target-tier phrase is excluded as out of scope; uncertain location, language, work mode, or configured minimum hours is sent to review only when a target-tier phrase matches. Explicit mismatches are excluded with their evidence, including explicit non-German remote restrictions. Multi-country locations that include Germany remain ambiguous when the feed omits a structured country. Per-tier language, exclusions, and hours limits live only in private configuration.
 
 Each run produces separate match, review, exclusion, and feed-health reports. City-level grouping is a first pass; verify the route to the exact worksite before treating a listing as reachable without a car.
 
 ## Durable state and alerts
 
-The private scheduled runner stores compact logical exports on a separate private state branch and restores them into DuckDB on each run. The first successful complete poll of each source is silent. Subsequent first-seen eligible listings enter a durable outbox. A claimed notification is persisted before sending. An interrupted send is marked ambiguous and is not retried automatically.
+The private runner stores compact logical exports on a separate private state branch and restores them into DuckDB on each run. It may be invoked manually or on a reviewed schedule. The first successful complete poll of each source is silent. Subsequent first-seen eligible listings enter a durable outbox. A claimed notification is persisted before sending. An interrupted send is marked ambiguous and is not retried automatically. Feed-health messages notify on a changed set of incomplete feeds and once on recovery, rather than repeating on every poll.
 
-Telegram delivery requires configured repository secrets and explicit approval. The workflow remains manual-only until its code, test results, dry-run, and recipient are reviewed. Never print secrets or send a test alert to an unconfirmed destination.
+Telegram delivery requires configured repository secrets and explicit approval. Keep recipient confirmation and delivery authorization in the private runtime. Never print secrets or send a test alert to an unconfirmed destination.
 
 ## Limits
 
