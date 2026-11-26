@@ -1341,3 +1341,76 @@ def test_queued_board_jobs_from_elsewhere_are_dropped_at_digest_time():
     Runner(cfg, state, clock=lambda: utc("2026-11-23T17:30:00Z"))._queue_alerts([], "2026-11-23T17:30:00Z")
     [entry] = state["outbox"]
     assert sorted(x["identity_key"] for x in entry["payload"]["items"]) == ["de", "ww"]
+
+def _html_400(monkeypatch, description=b'{"ok":false,"description":"Bad Request: can\'t parse entities: unsupported URL"}'):
+    import io
+    import urllib.error
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "synthetic-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "synthetic-chat")
+    monkeypatch.setenv("PENDEL_TELEGRAM_APPROVED", "true")
+    sent = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"ok": true}'
+
+    def urlopen(request, **_kw):
+        body = json.loads(request.data)
+        sent.append(body)
+        if body.get("parse_mode") == "HTML":
+            raise urllib.error.HTTPError("u", 400, "Bad Request", {}, io.BytesIO(description))
+        return Response()
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen", urlopen)
+    return sent
+
+
+def test_an_html_chunk_telegram_rejects_is_resent_as_plain_text_and_never_blocks(monkeypatch):
+    sent = _html_400(monkeypatch)
+    items = _indeed_jobs(14)
+    chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-25T17:05:00Z"), 0, compact=True, links=True)
+    state = {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": [
+        {"outbox_id": "daily:x", "status": "sending", "chunk_index": 0, "chunk_statuses": ["sending"],
+         "chunk_item_ids": members, "payload": {"items": items, "chunks": chunks, "parse_mode": "HTML"},
+         "attempts": 1, "created_at": "t", "updated_at": "", "error": ""}]}
+    runner = Runner(config(), state)
+    runner.deliver(True)
+    entry = state["outbox"][0]
+    assert entry["status"] == "pending" and "can't parse entities" in entry["error"]
+    parts = entry["payload"]["chunks"]
+    assert len(parts) >= 2 and all(len(p) <= 3900 for p in parts) and entry["payload"]["chunk_modes"] == [""] * len(parts)
+    assert "<a " not in "".join(parts) and "Lagerhelfer <Früh> & Spät 0\n  https://de.indeed.com/" in parts[0]
+    assert "&n=0" in parts[0] and parts[1].startswith(parts[0].split("\n")[0] + " (continued)")
+    assert sorted(sum(entry["chunk_item_ids"], [])) == sorted(sum(members, []))
+    while entry["status"] != "sent":
+        runner.claim()
+        runner.deliver(True)
+    assert all("parse_mode" not in m for m in sent[1:]) and len(sent) == 1 + len(parts)
+
+
+def test_other_rejections_keep_telegrams_reason_and_still_stop(monkeypatch):
+    _html_400(monkeypatch)
+    state = _sending_state()
+    state["outbox"][0]["payload"]["chunks"] = ["<b>x"]
+    state["outbox"][0]["payload"]["parse_mode"] = "Markdown"
+    import io
+    import urllib.error
+
+    def refuse(_request, **_kw):
+        raise urllib.error.HTTPError("u", 403, "Forbidden", {},
+                                     io.BytesIO(b'{"ok":false,"description":"Forbidden: bot was blocked by the user"}'))
+    monkeypatch.setattr("pendel.watch.urllib.request.urlopen", refuse)
+    Runner(config(), state).deliver(True)
+    entry = state["outbox"][0]
+    assert entry["status"] == "failed_manual" and "bot was blocked by the user" in entry["error"]
+
+
+def test_plain_parts_unescape_once():
+    from pendel.watch import html_to_plain_parts
+    [part] = html_to_plain_parts('📋 2 jobs\n• <a href="https://x.example/?a=1&amp;b=%26amp">A &amp;amp; B</a> · C &lt;D&gt;')
+    assert part == "📋 2 jobs\n• A &amp; B\n  https://x.example/?a=1&b=%26amp · C <D>"

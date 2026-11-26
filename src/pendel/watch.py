@@ -171,6 +171,30 @@ def pay_text(value) -> str:
     return f"{span} {symbol}" + (f"/{unit}" if unit else "")
 
 
+def html_to_plain_parts(text: str, max_chars: int = 3900) -> list[str]:
+    """S21c: an HTML list chunk as plain text ("title" then an indented URL line), split
+    into parts of at most ``max_chars``; each part after the first gets the header line."""
+    # Unescape each piece once: text between links, link titles and URLs separately.
+    pieces = re.split(r'<a href="([^"]*)">(.*?)</a>', str(text), flags=re.S)
+    plain = ""
+    for i in range(0, len(pieces), 3):
+        plain += html.unescape(re.sub(r"<[^>]+>", "", pieces[i]))
+        if i + 2 < len(pieces):
+            plain += f"{html.unescape(pieces[i + 2])}\n  {html.unescape(pieces[i + 1])}"
+    lines = plain.split("\n")
+    header = lines[0] if lines else ""
+    parts, current = [], ""
+    for line in lines:
+        line = line[:max_chars - len(header) - 20]
+        if current and len(current) + 1 + len(line) > max_chars:
+            parts.append(current)
+            current = header + " (continued)"
+        current = f"{current}\n{line}" if current else line
+    if current:
+        parts.append(current)
+    return parts or [""]
+
+
 def telegram_length(text: str) -> int:
     """S21: the length Telegram counts for an HTML message: the visible text after its
     tags and entities are parsed, in UTF-16 units (an emoji outside the BMP counts as 2)."""
@@ -1218,7 +1242,8 @@ class Runner:
             return 0
         index = item["chunk_index"]
         body = item["payload"]["chunks"][index]
-        parse_mode = str(item["payload"].get("parse_mode") or "")
+        modes = item["payload"].get("chunk_modes") or []
+        parse_mode = str(modes[index] if index < len(modes) else item["payload"].get("parse_mode") or "")
         if (telegram_length(body) if parse_mode == "HTML" else len(body)) > 4096:
             item["status"] = "failed_manual"
             item["chunk_statuses"][index] = "failed_manual"
@@ -1257,9 +1282,22 @@ class Runner:
                 item["status"] = "pending"
                 item["error"] = f"Telegram rate limit (HTTP 429); waited {wait}s, will retry"
             else:
-                item["chunk_statuses"][index] = "failed_manual"
-                item["status"] = "failed_manual"
-                item["error"] = f"Telegram rejected the request (HTTP {exc.code}); not delivered; review before retry"
+                # S21c: keep Telegram's own reason ("Bad Request: can't parse entities …").
+                try:
+                    reason = str(json.loads(exc.read().decode("utf-8")).get("description") or "")[:200]
+                except (ValueError, OSError, AttributeError):
+                    reason = ""
+                reason = f": {reason}" if reason else ""
+                if exc.code == 400 and parse_mode == "HTML":
+                    # Not delivered, so resending can't duplicate it. Replace the chunk with
+                    # plain-text parts (title, then the URL) so a formatting problem never blocks.
+                    self._replace_with_plain(item, index)
+                    item["error"] = f"Telegram rejected HTML (HTTP 400{reason}); resending as plain text"
+                else:
+                    item["chunk_statuses"][index] = "failed_manual"
+                    item["status"] = "failed_manual"
+                    item["error"] = (f"Telegram rejected the request (HTTP {exc.code}{reason}); "
+                                     "not delivered; review before retry")
         except (TimeoutError, urllib.error.URLError, OSError, http.client.HTTPException) as exc:
             # S16b: the owner accepts an occasional duplicate over a blocked feed, so an
             # uncertain send is retried up to delivery.uncertain_retries times before it
@@ -1285,6 +1323,28 @@ class Runner:
         item["updated_at"] = iso()
         print(f"Telegram digest state recorded as {item['status']}. {item['error']}".rstrip())
         return 0
+
+    @staticmethod
+    def _replace_with_plain(item: dict, index: int, max_chars: int = 3900) -> None:
+        """S21c: swap chunk ``index`` of an HTML entry for plain-text parts, all pending."""
+        payload = item["payload"]
+        parts = html_to_plain_parts(payload["chunks"][index], max_chars)
+        count = len(payload["chunks"])
+        default = str(payload.get("parse_mode") or "")
+        modes = list(payload.get("chunk_modes") or [default] * count)
+        modes += [default] * (count - len(modes))
+        ids = list(item.get("chunk_item_ids") or [[] for _ in range(count)])
+        ids += [[] for _ in range(count - len(ids))]
+        tries = list(item.get("chunk_uncertain") or [0] * count)
+        tries += [0] * (count - len(tries))
+        payload["chunks"][index:index + 1] = parts
+        modes[index:index + 1] = [""] * len(parts)
+        payload["chunk_modes"] = modes
+        item["chunk_statuses"][index:index + 1] = ["pending"] * len(parts)
+        item["chunk_item_ids"] = ids[:index] + [ids[index]] + [[] for _ in parts[1:]] + ids[index + 1:]
+        item["chunk_uncertain"] = tries[:index] + [0] * len(parts) + tries[index + 1:]
+        item["chunk_index"] = None
+        item["status"] = "pending"
 
     @staticmethod
     def _telegram_chunks(payload: dict, max_chars: int = 3900) -> list[str]:
