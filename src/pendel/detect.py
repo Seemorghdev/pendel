@@ -6,7 +6,8 @@ ats, ats_token and feed_url filled in. It never overwrites an existing file.
 
 Polite by design: robots.txt is respected, one page request per company,
 at least --delay seconds between requests, honest User-Agent, and the run
-aborts on HTTP 429 (rate limited) or on repeated network failures.
+skips a company whose site answers HTTP 429, and aborts on 429s from several sites in
+a row or on repeated network failures.
 
 Standard library only.
 
@@ -30,6 +31,7 @@ USER_AGENT = "pendel/0.1 (personal job-search tool, one request per company; +ht
 MAX_BYTES = 3_000_000
 TIMEOUT = 20
 MAX_NETWORK_ERRORS_IN_ROW = 5
+MAX_RATE_LIMITED_IN_ROW = 3
 
 UNKNOWN_ATS = {"", "unknown", "?", "none", "n/a", "na"}
 URL_COLUMNS = ["careers_url", "careers_page", "career_url", "careers", "jobs_url", "url", "website"]
@@ -40,6 +42,7 @@ BAD_TOKENS = {
     "", "www", "app", "api", "apply", "jobs", "careers", "embed", "v0", "v1", "j",
     "static", "assets", "cdn", "help", "support", "en", "de", "nl", "en-us",
     "js", "css", "img", "images", "privacy", "terms", "login", "signup",
+    "careers-analytics",  # Recruitee tracking script, present on many sites
 }
 
 # (ats, kind, regex, feed template). kind "open" = public JSON/XML feed,
@@ -194,7 +197,7 @@ def run(args):
                                if c not in fieldnames]
     throttle = Throttle(args.delay)
     statuses, found = Counter(), Counter()
-    net_errors_in_row = 0
+    net_errors_in_row = limited_in_row = 0
     done = 0
 
     # "x" mode: fails if the output already exists, so nothing is overwritten.
@@ -244,23 +247,28 @@ def run(args):
                         if hit is None:
                             status = "not_found"
                             note = "no known ATS link; page may load jobs with JavaScript: check by hand"
-                net_errors_in_row = 0
+                net_errors_in_row = limited_in_row = 0
             except urllib.error.HTTPError as e:
                 if e.code == 429:
-                    aborted = f"HTTP 429 at {url}"
-                    status = "rate_limited"
+                    status, note = "rate_limited", "site asked us to slow down; try again another day"
+                    limited_in_row += 1
                 else:
                     status = f"http_{e.code}"
+                    limited_in_row = 0
                 net_errors_in_row = 0
             except RateLimited as e:
-                aborted = f"HTTP 429 at {e}"
-                status = "rate_limited"
+                status, note = "rate_limited", f"429 at {e}; try again another day"
+                limited_in_row += 1
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 status = "network_error"
                 note = str(getattr(e, "reason", e))[:200]
                 net_errors_in_row += 1
                 if net_errors_in_row >= MAX_NETWORK_ERRORS_IN_ROW:
                     aborted = f"{net_errors_in_row} network errors in a row (connection down?)"
+            # Each company has its own site, so one 429 only skips that company.
+            # Several in a row means something shared is limiting us: stop.
+            if limited_in_row >= MAX_RATE_LIMITED_IN_ROW:
+                aborted = f"HTTP 429 from {limited_in_row} sites in a row"
 
             if hit:
                 row["ats"], row["ats_token"], row["feed_url"], note = hit

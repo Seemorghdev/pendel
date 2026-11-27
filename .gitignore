@@ -18,3 +18,17 @@ runs/
 # logs and secrets
 *.log
 .env
+.env.*
+
+# private runtime inputs and local discovery outputs
+/config/
+/private/
+/state/
+/companies/feeds.csv
+/companies/cities.csv
+/companies/candidates*.csv
+/companies/companies-*.csv
+/identifier.db
+*.db
+.DS_Store
+.idea/

@@ -28,6 +28,10 @@ def test_no_ats_returns_none():
     assert detect("<p>No ATS here, just www.example.com/careers</p>") is None
 
 
+def test_recruitee_tracking_script_is_not_a_board():
+    assert detect('<script src="https://careers-analytics.recruitee.com/tracker.js"></script>') is None
+
+
 @pytest.mark.parametrize("url, feed", [
     ("https://jobs.lever.co/acme", "https://api.lever.co/v0/postings/acme?mode=json"),
     ("https://jobs.eu.lever.co/acme", "https://api.eu.lever.co/v0/postings/acme?mode=json"),
