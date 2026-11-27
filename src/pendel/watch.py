@@ -68,6 +68,9 @@ VERIFY_LABELS = {"yes": "✅ employer listing", "unknown": "❓ board label only
 ROLE_MATCH_MIN = 0.75
 # S21: Telegram doesn't document a limit on links per message; stay well below any.
 MAX_LINKS_PER_MESSAGE = 50
+# S21d: total href characters per HTML message. Telegram doesn't publish its limit; 14 links
+# of ~16,000 characters were refused. A miss only costs the S21c plain-text fallback.
+LINK_CHARS_PER_MESSAGE = 6000
 EMPLOYER_ATS = (("greenhouse", "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"),
                 ("lever", "https://api.lever.co/v0/postings/{slug}?mode=json"),
                 ("ashby", "https://api.ashbyhq.com/posting-api/job-board/{slug}"))
@@ -831,8 +834,9 @@ class Runner:
                 title=f"⚡ {len(items)} {label} · {local:%a %d %b}", links=links)
             self._append_outbox("instant:", items, chunks, members, now, parse_mode="HTML" if links else "")
         else:
-            chunks = [self._instant_message(item, local) for item in items]
-            self._append_outbox("instant:", items, chunks, [[x["identity_key"]] for x in items], now)
+            chunks = [self._instant_message(item, local, links=links) for item in items]
+            self._append_outbox("instant:", items, chunks, [[x["identity_key"]] for x in items], now,
+                                parse_mode="HTML" if links else "")
 
     def rebundle(self) -> int:
         """S16, run once under the state lock: move the unsent chunks of pending instant
@@ -1021,23 +1025,32 @@ class Runner:
         return facts
 
     @staticmethod
-    def _instant_message(item: dict, local: datetime) -> str:
+    def _instant_message(item: dict, local: datetime, links: bool = False) -> str:
+        """One job. With ``links`` (S21d) it's Telegram HTML and the title is the link, so a
+        1,800-character tracking URL isn't printed. One link stays well inside Telegram's cap."""
+        esc = (lambda s: html.escape(str(s), quote=False)) if links else str
         tiers = "+".join(item.get("tiers", [])) or "?"
         place = " · ".join(x for x in (str(item.get("city") or "")[:150], str(item.get("company") or "")[:150]) if x)
-        lines = [f"🟢 T{tiers} · {str(item.get('title', ''))[:300]}"]
+        title = esc(str(item.get("title", ""))[:300])
+        if links and item.get("url"):
+            title = f'<a href="{html.escape(str(item["url"])[:2000], quote=True)}">{title}</a>'
+        lines = [f"🟢 T{esc(tiers)} · {title}"]
         if place:
-            lines.append(f"📍 {place}")
+            lines.append(f"📍 {esc(place)}")
         facts = Runner._facts(item)
         if item.get("night"):
             facts.append("🌙 US hours")
         if VERIFY_LABELS.get(str(item.get("verified") or "")):
             facts.append(VERIFY_LABELS[str(item["verified"])])
         if facts:
-            lines.append("  ".join(facts))
+            lines.append(esc("  ".join(facts)))
         # A match may still carry informational reasons; only a review needs a look.
         if item.get("status") == "review" and item.get("reasons"):
-            lines.append("⚠️ " + "; ".join(item["reasons"][:2])[:250])
-        if item.get("url"):
+            lines.append(esc("⚠️ " + "; ".join(item["reasons"][:2])[:250]))
+        if links:
+            if item.get("via"):
+                lines.append(esc(f"via {item['via']}"))
+        elif item.get("url"):
             lines.append(str(item["url"])[:1000] + (f"  (via {item['via']})" if item.get("via") else ""))
         return "\n".join(lines)
 
@@ -1060,7 +1073,8 @@ class Runner:
     def _daily_digest_chunks(items: list[dict], local: datetime, instant_count: int,
                              max_chars: int = 3900, speed: dict | None = None,
                              title: str | None = None, compact: bool = False,
-                             links: bool = False) -> tuple[list[str], list[list[str]]]:
+                             links: bool = False,
+                             link_budget: int = LINK_CHARS_PER_MESSAGE) -> tuple[list[str], list[list[str]]]:
         # S21: with ``links`` (and ``compact``) the chunks are Telegram HTML: each title is the
         # link, so the long tracking URLs don't count toward the message limit, which applies
         # to the visible text only. Every text piece is escaped; size checks use the visible length.
@@ -1081,6 +1095,7 @@ class Runner:
         chunks: list[str] = []
         members: list[list[str]] = []
         current, current_members = header, []
+        current_links = 0
         for label, group in sections:
             # Quickest hire first, then matches before reviews, stated pay first, then by city.
             jobs = sorted(group, key=lambda x: (Runner._hire_speed(x, speed), x.get("status") != "match",
@@ -1120,12 +1135,18 @@ class Runner:
                         entry += "\n  ⚠️ " + "; ".join(job["reasons"][:2])[:200]
                 if job.get("url") and not links:
                     entry += "\n  " + str(job["url"])[:1000]
+                # S21d: Telegram also caps the total length of the link addresses in one
+                # message (ENTITIES_TOO_LONG on 25 Nov: 14 links, ~16,000 characters).
+                href_chars = len(str(job["url"])[:2000]) if links and job.get("url") else 0
                 if current_members and (size(current) + size(entry) + size(footer) > max_chars
-                                        or (links and len(current_members) >= MAX_LINKS_PER_MESSAGE)):
+                                        or (links and len(current_members) >= MAX_LINKS_PER_MESSAGE)
+                                        or (links and current_links + href_chars > link_budget)):
                     chunks.append(current)
                     members.append(current_members)
                     current, current_members = header + " (continued)" + section, []
+                    current_links = 0
                 current += entry
+                current_links += href_chars
                 current_members.append(str(job.get("identity_key", "")))
         chunks.append(current + footer)
         members.append(current_members)

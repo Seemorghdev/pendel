@@ -1,5 +1,6 @@
 import csv
 import json
+import re
 from pathlib import Path
 
 from pendel import fetch
@@ -1237,11 +1238,14 @@ def _indeed_jobs(n):
 
 def test_link_titles_fit_57_jobs_with_long_tracking_links_into_far_fewer_messages():
     from html.parser import HTMLParser
+    from pendel import watch
     from pendel.watch import telegram_length
     items, local = _indeed_jobs(57), utc("2026-11-23T17:05:00Z")
     plain, _ = Runner._daily_digest_chunks(items, local, 0, compact=True)
     linked, members = Runner._daily_digest_chunks(items, local, 0, compact=True, links=True)
-    assert len(plain) >= 6 and len(linked) <= 2 and sum(map(len, members)) == 57
+    hrefs = [sum(len(h) for h in re.findall(r'href="([^"]*)"', chunk)) for chunk in linked]
+    assert len(plain) >= 6 and len(linked) == 5 and sum(map(len, members)) == 57
+    assert all(total <= watch.LINK_CHARS_PER_MESSAGE for total in hrefs)
     assert all(telegram_length(x) <= 3900 for x in linked)
     first = linked[0]
     assert '<a href="https://de.indeed.com/pagead/clk/dl?ad=' in first and "&amp;n=0" in first
@@ -1266,7 +1270,10 @@ def test_link_titles_fit_57_jobs_with_long_tracking_links_into_far_fewer_message
 
 def test_link_titles_cap_links_per_message():
     from pendel import watch
-    chunks, members = Runner._daily_digest_chunks(_indeed_jobs(120), utc("2026-11-23T17:05:00Z"), 0,
+    items = _indeed_jobs(120)
+    for i, job in enumerate(items):
+        job["url"] = f"https://example.test/{i}"
+    chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-23T17:05:00Z"), 0,
                                                   compact=True, links=True, max_chars=100_000)
     assert [len(m) for m in members] == [watch.MAX_LINKS_PER_MESSAGE, watch.MAX_LINKS_PER_MESSAGE, 20]
 
@@ -1414,3 +1421,28 @@ def test_plain_parts_unescape_once():
     from pendel.watch import html_to_plain_parts
     [part] = html_to_plain_parts('📋 2 jobs\n• <a href="https://x.example/?a=1&amp;b=%26amp">A &amp;amp; B</a> · C &lt;D&gt;')
     assert part == "📋 2 jobs\n• A &amp; B\n  https://x.example/?a=1&b=%26amp · C <D>"
+
+def test_long_tracking_links_are_spread_so_no_message_carries_too_many_link_characters():
+    from pendel import watch
+    items = _indeed_jobs(14)
+    for job in items:
+        job["url"] = "https://click.stepstone.de/f/a/" + "z" * 1760
+    chunks, members = Runner._daily_digest_chunks(items, utc("2026-11-25T17:05:00Z"), 0, compact=True, links=True)
+    hrefs = [sum(len(h) for h in re.findall(r'href="([^"]*)"', c)) for c in chunks]
+    assert sum(map(len, members)) == 14 and len(chunks) == 5
+    assert all(h <= watch.LINK_CHARS_PER_MESSAGE for h in hrefs)
+
+
+def test_a_single_alert_uses_a_title_link_when_link_titles_is_on():
+    item = _t3("one", title="IT-Supporter <Bonn>") | {"url": "https://click.stepstone.de/f/a/" + "z" * 1760,
+                                                      "via": "Jobicy", "salary": "46.000 €/Jahr"}
+    text = Runner._instant_message(item, utc("2026-11-27T08:00:00Z"), links=True)
+    assert text.startswith('🟢 T3 · <a href="https://click.stepstone.de/f/a/') and "IT-Supporter &lt;Bonn&gt;</a>" in text
+    assert text.count("https://") == 1 and text.endswith("via Jobicy")
+    plain = Runner._instant_message(item, utc("2026-11-27T08:00:00Z"))
+    assert "IT-Supporter <Bonn>" in plain and "\nhttps://click.stepstone.de" in plain
+    runner = Runner(delivery_config() | {"delivery": delivery_config()["delivery"] | {"link_titles": True}},
+                    {"schema_version": 1, "jobs": {}, "sources": {}, "outbox": []})
+    runner._append_instant([item], utc("2026-11-27T08:00:00Z"), "2026-11-27T08:00:00Z",
+                           runner.config["delivery"])
+    assert runner.state["outbox"][0]["payload"]["parse_mode"] == "HTML"
